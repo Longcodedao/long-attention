@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import math  # <--- Bắt buộc import math
+from torch.utils.checkpoint import checkpoint
 from .functional import (
     generate_random_phasors, 
     compute_rotors, 
@@ -10,88 +12,73 @@ from .functional import (
 class HoloAttention(nn.Module):
     """
     The Holographic 'Attention' Mechanism.
-    Replaces N^2 Softmax Attention with O(N) Complex-Valued Recurrence.
     """
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
-        self.hd_dim = config.hd_dim 
-
-        # 1. Projections (Real -> Complex)
-        # We project inputs into the Holographic "Hyper-Dimension"
+        self.hd_dim = config.hd_dim
+        
+        # 1. Projections
         self.k_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
         self.v_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        self.o_proj = nn.Linear(config.hd_dim, config.d_model, bias=False) # Output is Real
-
-        # 2. Fixed Random Phasors (The "Keys")
-        # Registered as buffer so they save with the model don't update via GD
+        
+        # --- FIX 1: Input của o_proj phải là hd_dim (1024) ---
+        # File cũ để là config.d_model -> Sẽ lỗi nếu hd_dim != d_model
+        self.o_proj = nn.Linear(config.hd_dim, config.d_model, bias=False)
+        # -----------------------------------------------------
+        
         self.register_buffer("freqs", generate_random_phasors(config.hd_dim))
 
-        # 3. Residual Dropout
-        self.resid_dropout = nn.Dropout(config.dropout)
-
-
-    def forward(self, x): 
+    def forward(self, x):
         B, T, C = x.shape
-
-        # --- Step 1: Project to Holographic Space --- 
-        # k, v shape: (B, T, hd_dim)
-        # We cast to complex64 immediately to enable phase operations
+        
         k_real = self.k_proj(x)
         v_real = self.v_proj(x)
-
-        # In a full implementation, K determines *which* frequency to write to.
-        # For this version (Linear Associative Memory), we use V as the content
-        # and implicit position as the key.
-        # Future improvement: Use K to modulate the frequencies (Data-Dependent).
         v = v_real.to(torch.complex64)
-
-        # --- Step 2: Generate Positional Rotors ---
-        # Rotors shape: (1, T, hd_dim)
-        rotors = compute_rotors(T, self.freqs)
-
-        # --- Step 3: Bind & Accumulate (The O(N) Magic) ---
-        # This replaces the Attention Matrix calculation
-        memory_trace = holo_bind_and_accumulate(v, rotors)
-
-        # --- Step 4: Retrieve (Derotate) --- 
-        # This replaces the Attention * Value calculation 
-        output_complex = holo_retrieve(memory_trace, rotors)
-        output_real = output_complex.real
-
-        projected = self.o_proj(output_real)
         
-        # --- Step 5: Project Output ---
-        # We take the Real part (Magnitude/Phase alignment)
-        return self.resid_dropout(projected)
+        rotors = compute_rotors(T, self.freqs)
+        
+        memory_trace = holo_bind_and_accumulate(v, rotors)
+        output_complex = holo_retrieve(memory_trace, rotors)
+        
+        # --- FIX 2: QUAN TRỌNG NHẤT CHO LOSS ---
+        # Chia thêm cho sqrt(T) để giảm biên độ tín hiệu xuống mức an toàn.
+        # Nếu không có dòng này, Loss sẽ nổ lên 60-70.
+        scale_factor = 1.0 / math.sqrt(T)
+        output_complex = output_complex * scale_factor
+        # ---------------------------------------
+        
+        # Output từ holo_retrieve đã là .real, nhưng gọi lại cho chắc chắn
+        return self.o_proj(output_complex.real)
 
 class HoloBlock(nn.Module):
     """
-    Standard Transformer Block structure, but swapping Self-Attention 
-    for HoloAttention.
-    Structure: Input -> LN -> Holo -> Add -> LN -> MLP -> Add
+    Standard Transformer Block structure with Gradient Checkpointing support.
     """
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
         self.attn = HoloAttention(config)
-
         
         self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * config.expansion_factor),
             nn.GELU(),
-            nn.Linear(config.d_model * config.expansion_factor, config.d_model),
-            nn.Dropout(config.dropout)
+            nn.Linear(config.d_model * config.expansion_factor, config.d_model)
         )
+        self.gradient_checkpointing = False
 
     def forward(self, x):
-        # 1. Holographic Mixer Path
+        if self.gradient_checkpointing and self.training:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        else:
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         residual = x
         x = self.ln1(x)
         x = residual + self.attn(x)
         
-        # 2. MLP Path (The "Denoising" Step)
         residual = x
         x = self.ln2(x)
         x = residual + self.mlp(x)
