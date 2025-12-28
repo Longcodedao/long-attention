@@ -15,48 +15,55 @@ class HoloAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
-        self.hd_dim = config.hd_dim
-        
+        self.hd_dim = config.hd_dim 
+
         # 1. Projections (Real -> Complex)
         # We project inputs into the Holographic "Hyper-Dimension"
         self.k_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
         self.v_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False) # Output is Real
-        
+        self.o_proj = nn.Linear(config.hd_dim, config.d_model, bias=False) # Output is Real
+
         # 2. Fixed Random Phasors (The "Keys")
-        # Registered as buffer so they save with the model but don't update via GD
+        # Registered as buffer so they save with the model don't update via GD
         self.register_buffer("freqs", generate_random_phasors(config.hd_dim))
 
-    def forward(self, x):
+        # 3. Residual Dropout
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+
+    def forward(self, x): 
         B, T, C = x.shape
-        
-        # --- Step 1: Project to Holographic Space ---
+
+        # --- Step 1: Project to Holographic Space --- 
         # k, v shape: (B, T, hd_dim)
         # We cast to complex64 immediately to enable phase operations
         k_real = self.k_proj(x)
         v_real = self.v_proj(x)
-        
+
         # In a full implementation, K determines *which* frequency to write to.
         # For this version (Linear Associative Memory), we use V as the content
         # and implicit position as the key.
         # Future improvement: Use K to modulate the frequencies (Data-Dependent).
         v = v_real.to(torch.complex64)
-        
+
         # --- Step 2: Generate Positional Rotors ---
         # Rotors shape: (1, T, hd_dim)
         rotors = compute_rotors(T, self.freqs)
-        
+
         # --- Step 3: Bind & Accumulate (The O(N) Magic) ---
         # This replaces the Attention Matrix calculation
         memory_trace = holo_bind_and_accumulate(v, rotors)
-        
-        # --- Step 4: Retrieve (Derotate) ---
-        # This replaces the Attention * Value calculation
+
+        # --- Step 4: Retrieve (Derotate) --- 
+        # This replaces the Attention * Value calculation 
         output_complex = holo_retrieve(memory_trace, rotors)
+        output_real = output_complex.real
+
+        projected = self.o_proj(output_real)
         
         # --- Step 5: Project Output ---
         # We take the Real part (Magnitude/Phase alignment)
-        return self.o_proj(output_complex)
+        return self.resid_dropout(projected)
 
 class HoloBlock(nn.Module):
     """
@@ -68,12 +75,14 @@ class HoloBlock(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
         self.attn = HoloAttention(config)
+
         
         self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * config.expansion_factor),
             nn.GELU(),
-            nn.Linear(config.d_model * config.expansion_factor, config.d_model)
+            nn.Linear(config.d_model * config.expansion_factor, config.d_model),
+            nn.Dropout(config.dropout)
         )
 
     def forward(self, x):
