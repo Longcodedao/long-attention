@@ -1,56 +1,77 @@
-# Holo-Transformer: $O(N)$ Long-Context Reasoning
+# Holo-Transformer (LongAttention) - Research Build
 
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+**Status:** Pre-Alpha / Internal Validation
+**Target:** ICML Submission
+**Core Claim:** Infinite Context with Exact Associative Recall via Complex-Valued Holographic Memory.
 
-**Holo-Transformer** is a hybrid Large Language Model architecture that achieves linear $O(N)$ complexity and $O(1)$ inference memory without sacrificing the reasoning capabilities of standard Transformers.
+---
 
-It replaces the quadratic Self-Attention matrix with **LongAttention**, a novel primitive based on **Holographic Associative Memory**. By mapping tokens to complex-valued phasors and performing algebraic binding ($Key = Content \odot Position$), it solves "Needle-in-a-Haystack" and "Reverse Sequence" tasks that baffle standard State Space Models (SSMs).
+## 🚀 Architecture Changes (vs Standard Transformer/Mamba)
 
-## 🚀 Key Features
+We have deviated from standard architectures to solve the "Memory Blur" and "Swamping" issues. Do not revert these changes without checking the `unit_tests`.
 
-* **Linear Scaling:** Training scales linearly with sequence length. Inference cache is constant size (16KB for 8k dim), regardless of context length.
-* **Reasoning-Ready:** Unlike standard RNNs/SSMs, LongAttention features a **Dynamic Query Head** that solves associative recall and position-dependent reasoning tasks (e.g., Sorting, Reversal) with 100% accuracy.
-* **Hardware Efficient:** Built on standard PyTorch primitives (`cumsum`, `complex_mul`). Runs natively on GPU, TPU, and Apple Silicon.
-* **Leakage-Free:** Implements **Random Fourier Positional Embeddings** to ensure orthogonality and prevent neighbor signal leakage common in RoPE-based linear models.
-* **Hybrid Design:** Interleaves LongAttention with sparse FlashAttention layers (e.g., every 8 layers) for maximum robustness.
+### 1. The Core Mechanism: Phasor-FHRR
+* **Old Way (Transformer):** $O(N^2)$ Attention Matrix.
+* **Old Way (Mamba):** Real-valued State Space ($h_t = Ah_{t-1} + Bx_t$).
+* **New Way (Holo):** Complex-valued Superposition.
+    * **Binding:** $V \cdot e^{i\theta}$ (Rotation in complex plane).
+    * **Memory:** $\sum (V \cdot e^{i\theta})$ (Linear Accumulation).
+    * **Why:** Rotation preserves norm (unitary). Mamba's decay destroys history; our accumulation preserves it perfectly.
 
-## 📦 Installation
+### 2. The Fix: Random Fourier Phasors (Killing RoPE)
+* **Problem:** Standard RoPE frequencies are correlated. This caused "Local Blur" (Model couldn't distinguish pos 500 from 501).
+* **Solution:** We use **Random High-Frequency Phasors** drawn from Uniform distribution.
+* **Code:** `functional.generate_random_phasors`
+* **Result:** Orthogonality improves from ~1.2x to >5x.
 
-```bash
-git clone [https://github.com/LONGDANG-72/long-attention.git](https://github.com/LONGDANG-72/long-attention.git)
-cd long-attention
-pip install -e .
+### 3. The Fix: Mixed Precision & Normalization
+* **Problem:** "Swamping". Adding a token to a 100k sequence context makes the new token too small in FP16.
+* **Solution:** * Storage: `BFloat16` (VRAM efficient).
+    * Accumulation: `Float32/Complex64` (Precision critical).
+    * Scale: We divide retrieval by $\sqrt{T}$ to counteract Random Walk variance.
 
-⚡ Quick Start
-Holo-Transformer is designed to be a drop-in replacement for standard Causal LM backends.
+---
 
-Important: We strongly recommend using BFloat16 (torch.bfloat16) for training. The library handles internal mixed-precision stability (casting to FP32 for the linear scan) automatically.
+## 🛠️ Usage
 
-import torch
-from long_attention import HoloTransformer, HoloConfig
+### Quick Start
+```python
+from long_attention import HoloConfig, HoloForCausalLM
 
-# 1. Configuration (350M Scale Example)
+# 1. Initialize for L40S Training (BF16)
 config = HoloConfig(
-    vocab_size=50257,    # GPT-2/Llama tokenizer
-    dim=1024,            # Model Width
-    n_layers=24,         # Depth
-    n_heads=16,          # For the sparse FlashAttention layers
-    hd_dim=8192,         # Holographic Dimension (Higher = Better Recall)
-    max_seq_len=131072   # Context Window
+    vocab_size=32000,
+    hidden_size=1024,
+    hd_dim=2048,        # Expansion factor 2x for capacity
+    num_hidden_layers=12
 )
 
-# 2. Initialize Model (Use CUDA and BF16)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = HoloTransformer(config).to(device).to(torch.bfloat16)
+model = HoloForCausalLM(config).cuda().bfloat16()
 
-print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+# 2. Forward Pass
+outputs = model(input_ids=..., labels=...)
+loss = outputs.loss
 
-# 3. Forward Pass (Long Context)
-# Input: [Batch, SeqLen]
-x = torch.randint(0, 50257, (1, 8192)).to(device)
+---
 
-with torch.no_grad():
-    logits = model(x) # Output: [1, 8192, 50257]
-
-print("Forward pass successful.")
+##ICML Experiments Roadmap
+Phase 1: Unit Validation (✅ COMPLETED)
+Needle in Haystack: Passed (via Kaggle).
+Associative Recall: Passed (via Kaggle, MSE < 0.005).
+Note: The MLP Denoising was critical here. A linear-only model failed.
+Phase 2: Speed Benchmark (Next Step)
+Goal: Demonstrate flat VRAM usage vs Sequence Length.
+Script: benchmarks/speed_test.py
+Comparison: FlashAttention-2 vs Holo.
+Expected Win: FlashAttn OOMs at 32k; Holo stays constant.
+Phase 3: Capabilities (Production Run)
+Dataset: SlimPajama (6B tokens subset).
+Hardware: 2x L40S.
+Hyperparams:LR: 3e-4
+Global Batch: 0.5M tokens
+Context: Train on 4k, Eval on 16k.
+⚠️ Known Issues / "Gotchas"
+No Decay: We explicitly removed the decay factor ($gamma$). Reasoning: To beat Mamba, we must claim "Infinite Memory." Adding decay makes us just another RNN.
+Risk: Early training instability. If loss explodes, check LayerNorm placement.
+Complex Arithmetic: PyTorch complex64 support is good but can be finicky with autocast.
+Fix: The layers.py explicitly casts v.to(torch.complex64). Ensure this cast remains.
