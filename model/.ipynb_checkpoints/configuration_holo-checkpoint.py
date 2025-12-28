@@ -13,6 +13,7 @@ class HoloConfig(PretrainedConfig):
         max_position_embeddings=8192,
         layer_norm_eps=1e-5,
         initializer_range=0.02,
+        dropout = 0.0,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
@@ -36,6 +37,7 @@ class HoloConfig(PretrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
         self.tie_word_embeddings = tie_word_embeddings
+        self.dropout = dropout
 
         super().__init__(
             pad_token_id=pad_token_id,

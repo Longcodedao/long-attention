@@ -80,23 +80,29 @@ def benchmark_model(model_variant, seq_len):
 
     # --- 2. Setup Data ---
     # Random tokens
-    input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, seq_len)).to(device)
+    # NOTE: Input IDs MUST be LongTensor (integers) for Embedding lookup.
+    input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, seq_len), dtype=torch.long).to(device)
 
     # --- 3. Training Benchmark (Throughput) ---
     train_mem = "OOM"
     throughput = 0.0
     
     try:
-        # Warmup pass
-        _ = model(input_ids)
+        # Warmup pass (with Autocast)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _ = model(input_ids)
+            
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         
         # Measured pass (Forward + Backward)
         start_time = time.time()
         
-        outputs = model(input_ids, labels=input_ids)
-        loss = outputs.loss
+        # --- ENABLE AUTOCAST HERE ---
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids, labels=input_ids)
+            loss = outputs.loss
+            
         loss.backward()
         
         torch.cuda.synchronize()
@@ -122,12 +128,11 @@ def benchmark_model(model_variant, seq_len):
         try:
             with torch.no_grad():
                 if "Holo" in model_variant:
-                    # Holo has constant state, standard forward reveals peak
-                    _ = model(input_ids)
-                else:
-                    # Transformers allocate KV Cache during generation/forward with cache
-                    # We verify memory usage of a full context loaded into cache
-                    _ = model(input_ids, use_cache=True)
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        if "Holo" in model_variant:
+                            _ = model(input_ids)
+                        else:
+                            _ = model(input_ids, use_cache=True)
             
             infer_mem = get_peak_memory_mb()
             
