@@ -40,7 +40,6 @@ class HoloAttention(nn.Module):
         # For this version (Linear Associative Memory), we use V as the content
         # and implicit position as the key.
         # Future improvement: Use K to modulate the frequencies (Data-Dependent).
-        
         v = v_real.to(torch.complex64)
         
         # --- Step 2: Generate Positional Rotors ---

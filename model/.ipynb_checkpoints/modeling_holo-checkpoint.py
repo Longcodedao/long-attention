@@ -7,6 +7,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from .configuration_holo import HoloConfig
 from .layers import HoloBlock
 
+
 class HoloPreTrainedModel(PreTrainedModel):
     """
     Base class for Holo-Transformer weights initialization and utilities.
@@ -44,14 +45,14 @@ class HoloModel(HoloPreTrainedModel):
         # 1. Embeddings
         # Note: We do NOT use Positional Embeddings here. 
         # The Holographic Layer handles position via complex rotation internally.
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.wte = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(0.0) # Usually 0 for LLMs, but kept for interface
 
         # 2. The Stack
         self.h = nn.ModuleList([HoloBlock(config) for _ in range(config.num_hidden_layers)])
         
         # 3. Final Norm
-        self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
 
         self.post_init()
 
@@ -109,7 +110,7 @@ class HoloForCausalLM(HoloPreTrainedModel):
         self.holo = HoloModel(config)
         
         # LM Head (Projects back to Vocab)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Weight Tying (Optional but standard)
         if config.tie_word_embeddings:

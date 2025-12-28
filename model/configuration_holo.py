@@ -28,7 +28,7 @@ class HoloConfig(PretrainedConfig):
                           superposition noise (crosstalk).
         """
         self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
+        self.d_model = hidden_size
         self.hd_dim = hd_dim
         self.num_hidden_layers = num_hidden_layers
         self.expansion_factor = expansion_factor
