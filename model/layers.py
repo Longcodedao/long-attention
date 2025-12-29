@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import math  # <--- Bắt buộc import math
-from torch.utils.checkpoint import checkpoint
 from .functional import (
     generate_random_phasors, 
     compute_rotors, 
@@ -11,76 +9,98 @@ from .functional import (
 
 class HoloAttention(nn.Module):
     """
-    The Holographic 'Attention' Mechanism.
+    The Holographic 'Attention' Mechanism (v7 Production).
+    Features:
+    1. Dual-Path: Positional (Indexing) + Associative (Recall).
+    2. Shared Q/K: Forces instant alignment for associative recall.
+    3. Gated Mixing: Learnable balance between Time and Content.
+    4. Phase Scaling: High-variance initialization for orthogonality.
     """
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
         self.hd_dim = config.hd_dim
-        
-        # 1. Projections
-        self.k_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        
-        # --- FIX 1: Input của o_proj phải là hd_dim (1024) ---
-        # File cũ để là config.d_model -> Sẽ lỗi nếu hd_dim != d_model
-        self.o_proj = nn.Linear(config.hd_dim, config.d_model, bias=False)
-        # -----------------------------------------------------
-        
-        self.register_buffer("freqs", generate_random_phasors(config.hd_dim))
+        self.phase_scale = config.phase_scale
 
-    def forward(self, x):
+        # 1. Projections (Real -> Complex)
+        # We project inputs into the Holographic "Hyper-Dimension"        
+        self.v_proj = nn.Linear(self.d_model, self.hd_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.hd_dim, bias=False) # Shared Q/K
+        self.o_proj = nn.Linear(self.hd_dim, self.d_model, bias=False)
+        
+        # Fixed Positional Phasors
+        self.register_buffer("freqs", generate_random_phasors(self.hd_dim))
+        
+        # Learnable Gate (Initialize balanced)
+        self.gate = nn.Parameter(torch.tensor([0.5, 0.5]))
+
+
+        self.dropout = nn.Dropout(p = config.dropout)
+    
+    def forward(self, x): 
         B, T, C = x.shape
         
+        # 1. Values
         k_real = self.k_proj(x)
         v_real = self.v_proj(x)
+
         v = v_real.to(torch.complex64)
         
+        # 2. Keys (Scaled for Orthogonality)
+        k_angle = k_real * self.phase_scale
+        k = torch.exp(1j * k_angle) 
+        q = k # Shared Q/K
+        
+        # 3. Path A: Positional Memory (Indexing)
         rotors = compute_rotors(T, self.freqs)
+        mem_pos = holo_bind_and_accumulate(v, rotors)
+        out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
         
-        memory_trace = holo_bind_and_accumulate(v, rotors)
-        output_complex = holo_retrieve(memory_trace, rotors)
+        # 4. Path B: Associative Memory (Recall)
+        k_shifted = torch.roll(k, shifts=1, dims=1)
+        k_shifted[:, 0, :] = 0 # Zero out first token history
         
-        # --- FIX 2: QUAN TRỌNG NHẤT CHO LOSS ---
-        # Chia thêm cho sqrt(T) để giảm biên độ tín hiệu xuống mức an toàn.
-        # Nếu không có dòng này, Loss sẽ nổ lên 60-70.
-        scale_factor = 1.0 / math.sqrt(T)
-        output_complex = output_complex * scale_factor
-        # ---------------------------------------
+        mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
+        out_assoc = holo_retrieve(mem_assoc, q)
         
-        # Output từ holo_retrieve đã là .real, nhưng gọi lại cho chắc chắn
-        return self.o_proj(output_complex.real)
+        # 5. Gated Merge
+        out_combined = (out_pos * self.gate[0]) + (out_assoc * self.gate[1])
+        output = self.o_project(out_combined)
+
+        return self.dropout(output)
+                          
 
 class HoloBlock(nn.Module):
     """
-    Standard Transformer Block structure with Gradient Checkpointing support.
+    Standard Transformer Block with LayerScale for deep signal propagation.
     """
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model)
+        self.ln1 = nn.LayerNorm(config.hidden_size)
         self.attn = HoloAttention(config)
+        self.ln2 = nn.LayerNorm(config.hidden_size)
         
-        self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model * config.expansion_factor),
+            nn.Linear(config.hidden_size, config.hidden_size * config.expansion_factor),
             nn.GELU(),
-            nn.Linear(config.d_model * config.expansion_factor, config.d_model)
+            nn.Linear(config.d_model * config.expansion_factor, config.d_model),
+            nn.Dropout(config.dropout)
+            nn.Linear(config.hidden_size * config.expansion_factor, config.hidden_size)
         )
-        self.gradient_checkpointing = False
+        
+        # LayerScale: Initialize to small value (0.1) to ease optimization
+        self.gamma1 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
 
     def forward(self, x):
-        if self.gradient_checkpointing and self.training:
-            return checkpoint(self._forward_impl, x, use_reentrant=False)
-        else:
-            return self._forward_impl(x)
-
-    def _forward_impl(self, x):
-        residual = x
-        x = self.ln1(x)
-        x = residual + self.attn(x)
+        # Residual connection 1 (Mixer)
+        res = x
+        x = self.attn(self.ln1(x))
+        x = res + self.gamma1 * x
         
-        residual = x
-        x = self.ln2(x)
-        x = residual + self.mlp(x)
+        # Residual connection 2 (MLP)
+        res = x
+        x = self.mlp(self.ln2(x))
+        x = res + self.gamma2 * x
         
         return x
