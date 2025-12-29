@@ -6,8 +6,9 @@ class HoloConfig(PretrainedConfig):
     def __init__(
         self,
         vocab_size=50257,        # Default to GPT-2 tokenizer size
-        hidden_size=768,         # This is 'd_model'
-        hd_dim=2048,             # The Holographic Bus (Key/Value expansion)
+        d_model=768,         # This is 'd_model'
+        hd_dim=None,             # The Holographic Bus (Key/Value expansion)
+        holo_expansion_ratio=8,  # Default to 8x capacity
         num_hidden_layers=12,    # Depth
         expansion_factor=4,      # MLP expansion (usually 4x hidden_size)
         max_position_embeddings=8192,
@@ -17,6 +18,7 @@ class HoloConfig(PretrainedConfig):
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        phase_scale=3.0,
         tie_word_embeddings=False, # Whether to tie input/output embeddings
         **kwargs,
     ):
@@ -29,15 +31,23 @@ class HoloConfig(PretrainedConfig):
                           superposition noise (crosstalk).
         """
         self.vocab_size = vocab_size
-        self.d_model = hidden_size
-        self.hd_dim = hd_dim
+        self.d_model = d_model
         self.num_hidden_layers = num_hidden_layers
         self.expansion_factor = expansion_factor
         self.max_position_embeddings = max_position_embeddings
+        
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range
         self.tie_word_embeddings = tie_word_embeddings
+        
         self.dropout = dropout
+        self.holo_expansion_ratio = holo_expansion_ratio
+        self.phase_scale = phase_scale
+
+        if hd_dim is None:
+            self.hd_dim = d_model * holo_expansion_ratio
+        else:
+            self.hd_dim = d_model
 
         super().__init__(
             pad_token_id=pad_token_id,

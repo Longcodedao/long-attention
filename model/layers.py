@@ -9,91 +9,98 @@ from .functional import (
 
 class HoloAttention(nn.Module):
     """
-    The Holographic 'Attention' Mechanism.
-    Replaces N^2 Softmax Attention with O(N) Complex-Valued Recurrence.
+    The Holographic 'Attention' Mechanism (v7 Production).
+    Features:
+    1. Dual-Path: Positional (Indexing) + Associative (Recall).
+    2. Shared Q/K: Forces instant alignment for associative recall.
+    3. Gated Mixing: Learnable balance between Time and Content.
+    4. Phase Scaling: High-variance initialization for orthogonality.
     """
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
-        self.hd_dim = config.hd_dim 
+        self.hd_dim = config.hd_dim
+        self.phase_scale = config.phase_scale
 
         # 1. Projections (Real -> Complex)
-        # We project inputs into the Holographic "Hyper-Dimension"
-        self.k_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.hd_dim, bias=False)
-        self.o_proj = nn.Linear(config.hd_dim, config.d_model, bias=False) # Output is Real
+        # We project inputs into the Holographic "Hyper-Dimension"        
+        self.v_proj = nn.Linear(self.d_model, self.hd_dim, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.hd_dim, bias=False) # Shared Q/K
+        self.o_proj = nn.Linear(self.hd_dim, self.d_model, bias=False)
+        
+        # Fixed Positional Phasors
+        self.register_buffer("freqs", generate_random_phasors(self.hd_dim))
+        
+        # Learnable Gate (Initialize balanced)
+        self.gate = nn.Parameter(torch.tensor([0.5, 0.5]))
 
-        # 2. Fixed Random Phasors (The "Keys")
-        # Registered as buffer so they save with the model don't update via GD
-        self.register_buffer("freqs", generate_random_phasors(config.hd_dim))
 
-        # 3. Residual Dropout
-        self.resid_dropout = nn.Dropout(config.dropout)
-
-
+        self.dropout = nn.Dropout(p = config.dropout)
+    
     def forward(self, x): 
         B, T, C = x.shape
-
-        # --- Step 1: Project to Holographic Space --- 
-        # k, v shape: (B, T, hd_dim)
-        # We cast to complex64 immediately to enable phase operations
+        
+        # 1. Values
         k_real = self.k_proj(x)
         v_real = self.v_proj(x)
 
-        # In a full implementation, K determines *which* frequency to write to.
-        # For this version (Linear Associative Memory), we use V as the content
-        # and implicit position as the key.
-        # Future improvement: Use K to modulate the frequencies (Data-Dependent).
         v = v_real.to(torch.complex64)
-
-        # --- Step 2: Generate Positional Rotors ---
-        # Rotors shape: (1, T, hd_dim)
-        rotors = compute_rotors(T, self.freqs)
-
-        # --- Step 3: Bind & Accumulate (The O(N) Magic) ---
-        # This replaces the Attention Matrix calculation
-        memory_trace = holo_bind_and_accumulate(v, rotors)
-
-        # --- Step 4: Retrieve (Derotate) --- 
-        # This replaces the Attention * Value calculation 
-        output_complex = holo_retrieve(memory_trace, rotors)
-        output_real = output_complex.real
-
-        projected = self.o_proj(output_real)
         
-        # --- Step 5: Project Output ---
-        # We take the Real part (Magnitude/Phase alignment)
-        return self.resid_dropout(projected)
+        # 2. Keys (Scaled for Orthogonality)
+        k_angle = k_real * self.phase_scale
+        k = torch.exp(1j * k_angle) 
+        q = k # Shared Q/K
+        
+        # 3. Path A: Positional Memory (Indexing)
+        rotors = compute_rotors(T, self.freqs)
+        mem_pos = holo_bind_and_accumulate(v, rotors)
+        out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
+        
+        # 4. Path B: Associative Memory (Recall)
+        k_shifted = torch.roll(k, shifts=1, dims=1)
+        k_shifted[:, 0, :] = 0 # Zero out first token history
+        
+        mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
+        out_assoc = holo_retrieve(mem_assoc, q)
+        
+        # 5. Gated Merge
+        out_combined = (out_pos * self.gate[0]) + (out_assoc * self.gate[1])
+        output = self.o_project(out_combined)
+
+        return self.dropout(output)
+                          
 
 class HoloBlock(nn.Module):
     """
-    Standard Transformer Block structure, but swapping Self-Attention 
-    for HoloAttention.
-    Structure: Input -> LN -> Holo -> Add -> LN -> MLP -> Add
+    Standard Transformer Block with LayerScale for deep signal propagation.
     """
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.d_model)
+        self.ln1 = nn.LayerNorm(config.hidden_size)
         self.attn = HoloAttention(config)
-
+        self.ln2 = nn.LayerNorm(config.hidden_size)
         
-        self.ln2 = nn.LayerNorm(config.d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model * config.expansion_factor),
+            nn.Linear(config.hidden_size, config.hidden_size * config.expansion_factor),
             nn.GELU(),
             nn.Linear(config.d_model * config.expansion_factor, config.d_model),
             nn.Dropout(config.dropout)
+            nn.Linear(config.hidden_size * config.expansion_factor, config.hidden_size)
         )
+        
+        # LayerScale: Initialize to small value (0.1) to ease optimization
+        self.gamma1 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
 
     def forward(self, x):
-        # 1. Holographic Mixer Path
-        residual = x
-        x = self.ln1(x)
-        x = residual + self.attn(x)
+        # Residual connection 1 (Mixer)
+        res = x
+        x = self.attn(self.ln1(x))
+        x = res + self.gamma1 * x
         
-        # 2. MLP Path (The "Denoising" Step)
-        residual = x
-        x = self.ln2(x)
-        x = residual + self.mlp(x)
+        # Residual connection 2 (MLP)
+        res = x
+        x = self.mlp(self.ln2(x))
+        x = res + self.gamma2 * x
         
         return x
