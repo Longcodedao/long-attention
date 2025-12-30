@@ -30,11 +30,19 @@ We have deviated from standard architectures to solve the "Memory Blur" and "Swa
     * Accumulation: `Float32/Complex64` (Precision critical).
     * Scale: We divide retrieval by $\sqrt{T}$ to counteract Random Walk variance.
 
+<<<<<<< HEAD
 ### 29/12/2025
 # Holo-Transformer (v7)
 A PyTorch implementation of the **Holographic Transformer**, a linear-complexity ($O(N)$) architecture that combines the reasoning capabilities of Attention with the efficiency of Recurrent Neural Networks.
 
 ## Key Architecture Innovations (v7)
+=======
+## 29/12/2025
+### Holo-Transformer (v7)
+A PyTorch implementation of the **Holographic Transformer**, a linear-complexity ($O(N)$) architecture that combines the reasoning capabilities of Attention with the efficiency of Recurrent Neural Networks.
+
+### Key Architecture Innovations (v7)
+>>>>>>> pipeline
 Today's update introduces the **Dual-Path Gated Architecture**, solving the "Recall vs. Indexing" trade-off:
 1.  **Holographic Dual-Path Memory:**
     * **Path A (Positional):** Encodes absolute order using high-frequency Rotors ($V_t \cdot R_t$). Solves precise indexing tasks (e.g., "What is the 5th token?").
@@ -44,7 +52,11 @@ Today's update introduces the **Dual-Path Gated Architecture**, solving the "Rec
 3.  **Spectral Stabilization:**
     * **Phase Scaling:** Initializing phase projections with high variance ($\sigma=3.0$) to force immediate orthogonality in the complex plane.
     * **LayerScale:** Residual branches are scaled by $\epsilon=0.1$ to ensure signal propagation through deep (12+ layer) networks.
+<<<<<<< HEAD
     * 
+=======
+
+>>>>>>> pipeline
 ## Benchmark Results (12-Layer Depth)
 Comparison against standard Llama-2 (Transformer) and Deep GRU (Recurrent) baselines on 32k context.
 | Model | Complexity | Speed (32k ctx) | Needle Recall (1k steps) |
@@ -55,6 +67,29 @@ Comparison against standard Llama-2 (Transformer) and Deep GRU (Recurrent) basel
 
 *Note: Holo-Transformer provides a 2x speedup over FlashAttention-v2 Transformers while retaining the inductive bias required to solve associative recall tasks that pure RNNs fail at.*
 
+<<<<<<< HEAD
+=======
+
+### 30/12/2025
+## Update: Multi-Head "Spectrogram" Architecture (v8) 
+We have upgraded the Holo-Transformer from a single holographic stream to a Multi-Head Frequency-Division Architecture. This aligns our model structurally with Llama/GPT while introducing a novel "Cognitive Spectrogram" mechanism. 
+
+**What Changed?**
+Instead of one large memory vector, we now split the holographic state into H independent heads. Crucially, these heads are not initialized identically. We apply Multi-Scale Initialization: 
+- *High-Frequency Heads (0-2)*: Initialized with high variance ($\sigma \approx 10.0$). These spin fast, acting as Short-Term Memory (precise local texture)
+- *Mid-Frequency Heads (3-5)*: Balanced variance ($\sigma \approx 3.0$ ). Standard associative recall.
+- *Low-Frequency Heads (6-7)*: Low variance ($\sigma \approx 0.1$). These spin slowly, acting as Long-Term Archives (global gist) that resist noise over long contexts.
+
+**Why?** 
+* Extended Effective Context: By routing stable information to "Slow" heads and volatile information to "Fast" heads, we reduce the crosstalk noise that usually limits holographic capacity. 
+* Gated Specialization: Each head has its own independent Time/Content Gate. Some heads can specialize purely in Indexing (Time), while others specialize purely in Reasoning (Content).
+* New Hyperparameters:
+    * num_heads: Default 8. (Splits the hd_dim evenly).
+    * phase_scale: Now acts as the base scale for the geometric distribution across heads.
+
+
+
+>>>>>>> pipeline
 ---
 
 ## 🛠️ Usage

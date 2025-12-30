@@ -5,7 +5,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from .configuration_holo import HoloConfig
 from .layers import HoloBlock
 
-
 class HoloPreTrainedModel(PreTrainedModel):
     config_class = HoloConfig
     base_model_prefix = "holo"
@@ -23,70 +22,58 @@ class HoloPreTrainedModel(PreTrainedModel):
 class HoloModel(HoloPreTrainedModel):
     def __init__(self, config: HoloConfig):
         super().__init__(config)
-<<<<<<< HEAD:model/modeling_holo.py
-        self.config = config
-
-        # 1. Embeddings
-        # Note: We do NOT use Positional Embeddings here. 
-        # The Holographic Layer handles position via complex rotation internally.
-        self.wte = nn.Embedding(config.vocab_size, config.d_model)
-        self.drop = nn.Dropout(0.0) # Usually 0 for LLMs, but kept for interface
-
-        # 2. The Stack
-        self.h = nn.ModuleList([HoloBlock(config) for _ in range(config.num_hidden_layers)])
-        
-        # 3. Final Norm
-        self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-
-=======
         self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
         self.drop = nn.Dropout(0.0)
         self.h = nn.ModuleList([HoloBlock(config) for _ in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
->>>>>>> origin/main:modeling_holo.py
         self.post_init()
 
-    def get_input_embeddings(self): return self.wte
-    def set_input_embeddings(self, value): self.wte = value
+    def get_input_embeddings(self): 
+        return self.wte
+        
+    def set_input_embeddings(self, value): 
+        self.wte = value
 
     def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
         hidden_states = self.drop(inputs_embeds)
+        
         for block in self.h:
             hidden_states = block(hidden_states)
+            
         hidden_states = self.ln_f(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+
 
 class HoloForCausalLM(HoloPreTrainedModel):
     def __init__(self, config: HoloConfig):
         super().__init__(config)
         self.holo = HoloModel(config)
-<<<<<<< HEAD:model/modeling_holo.py
-        
-        # LM Head (Projects back to Vocab)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-
-        # Weight Tying (Optional but standard)
-=======
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
->>>>>>> origin/main:modeling_holo.py
         if config.tie_word_embeddings:
             self.lm_head.weight = self.holo.wte.weight
         self.post_init()
 
-    def get_input_embeddings(self): return self.holo.wte
-    def set_input_embeddings(self, value): self.holo.wte = value
-    def get_output_embeddings(self): return self.lm_head
+    def get_input_embeddings(self):
+        return self.holo.wte
+        
+    def set_input_embeddings(self, value): 
+        self.holo.wte = value
+        
+    def get_output_embeddings(self): 
+        return self.lm_head
 
     def forward(self, input_ids=None, labels=None, inputs_embeds=None, **kwargs):
         outputs = self.holo(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         loss = None
+        
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            
         return CausalLMOutputWithPast(loss=loss, logits=logits)

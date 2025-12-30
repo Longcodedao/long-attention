@@ -1,0 +1,17 @@
+.ipynb_checkpoints/
+.ipynb_checkpoints/*
+
+bench_temp/
+benchmarks/
+checkpoints/
+results_GPT2/
+results_Holo/
+results_holo_final/
+results_holo_fixed/
+results_holo_safe/
+results_slimpajama/
+
+model/.ipynb_checkpoints/
+model/.ipynb_checkpoints/* 
+model/__pycache__/
+model/__pycache__/*

@@ -8,6 +8,8 @@ class HoloConfig(PretrainedConfig):
         vocab_size=50257,        # Default to GPT-2 tokenizer size
         d_model=768,         # This is 'd_model'
         hd_dim=None,             # The Holographic Bus (Key/Value expansion)
+        num_heads=8,             # Multi-Head Default
+
         holo_expansion_ratio=8,  # Default to 8x capacity
         num_hidden_layers=12,    # Depth
         expansion_factor=4,      # MLP expansion (usually 4x hidden_size)
@@ -32,6 +34,8 @@ class HoloConfig(PretrainedConfig):
         """
         self.vocab_size = vocab_size
         self.d_model = d_model
+        self.num_heads = num_heads
+
         self.num_hidden_layers = num_hidden_layers
         self.expansion_factor = expansion_factor
         self.max_position_embeddings = max_position_embeddings
@@ -48,7 +52,12 @@ class HoloConfig(PretrainedConfig):
             self.hd_dim = d_model * holo_expansion_ratio
         else:
             self.hd_dim = d_model
-
+            
+        if self.hd_dim % num_heads != 0:
+            raise ValueError(f"hd_dim {self.hd_dim} must be divisible by num_heads {num_heads}")
+            
+        self.head_dim = self.hd_dim // num_heads
+        
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
