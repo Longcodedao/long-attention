@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .functional import (
-    generate_random_phasors, 
+    generate_multiscale_phasors, 
     compute_rotors, 
     holo_bind_and_accumulate, 
     holo_retrieve
@@ -19,6 +19,8 @@ class HoloAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.d_model = config.d_model
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
         self.hd_dim = config.hd_dim
         self.phase_scale = config.phase_scale
 
@@ -29,42 +31,60 @@ class HoloAttention(nn.Module):
         self.o_proj = nn.Linear(self.hd_dim, self.d_model, bias=False)
         
         # Fixed Positional Phasors
-        self.register_buffer("freqs", generate_random_phasors(self.hd_dim))
-        
-        # Learnable Gate (Initialize balanced)
-        self.gate = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.register_buffer("freqs", generate_random_phasors(self.num_heads, self.head_dim))
 
+        # 3. Multi-Head Gating
+        # Each head gets its own [Positional, Associative] weighting
+        # Shape: (num_heads, 2)
+        # Learnable Gate (Initialize balanced)
+        self.gate = nn.Parameter(
+            torch.ones(self.num_heads, 2) * 0.5
+        )
 
         self.dropout = nn.Dropout(p = config.dropout)
     
     def forward(self, x): 
         B, T, C = x.shape
+        H = self.num_heads
+        D = self.head_dim
         
-        # 1. Values
-        k_real = self.k_proj(x)
-        v_real = self.v_proj(x)
+        # --- 1. Project & Split Heads ---
+        # (B, T, hd_dim) -> (B, T, H, D)
+        k_real = self.k_proj(x).view(B, T, H, D)
+        v_real = self.v_proj(x).view(B, T, H, D)
 
         v = v_real.to(torch.complex64)
         
-        # 2. Keys (Scaled for Orthogonality)
+        # Keys (Scaled for Orthogonality)
         k_angle = k_real * self.phase_scale
         k = torch.exp(1j * k_angle) 
         q = k # Shared Q/K
         
-        # 3. Path A: Positional Memory (Indexing)
+        # --- 2. Path A: Positional (Time) ---
+        # Rotors are computed per-head based on their specific frequencies
         rotors = compute_rotors(T, self.freqs)
         mem_pos = holo_bind_and_accumulate(v, rotors)
         out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
         
-        # 4. Path B: Associative Memory (Recall)
+        # --- 3. Path B: Associative (Content) ---
+        # Shift K along the Time axis
         k_shifted = torch.roll(k, shifts=1, dims=1)
         k_shifted[:, 0, :] = 0 # Zero out first token history
         
         mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
         out_assoc = holo_retrieve(mem_assoc, q)
         
-        # 5. Gated Merge
-        out_combined = (out_pos * self.gate[0]) + (out_assoc * self.gate[1])
+        # --- 4. Gated Merge (Per Head) ---
+        # gate[:, 0] is Positional weight, gate[:, 1] is Associative weight
+        # Broadcast: (H) -> (1, 1, H, 1)        
+        g_pos = self.gate[:, 0].view(1, 1, H, 1)
+        g_assoc = self.gate[:, 1].view(1, 1, H, 1)
+        
+        out_combined = (out_pos * g_pos) + (out_assoc * g_assoc)
+
+        # --- 5. Concatenate & Output ---
+        # Flatten H and D back to hd_dim
+        out_combined = out_combined.flatten(2)
         output = self.o_project(out_combined)
 
         return self.dropout(output)
