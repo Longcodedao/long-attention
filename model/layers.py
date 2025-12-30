@@ -68,7 +68,7 @@ class HoloAttentionV1(nn.Module):
         
         # 5. Gated Merge
         out_combined = (out_pos * self.gate[0]) + (out_assoc * self.gate[1])
-        output = self.o_project(out_combined)
+        output = self.o_proj(out_combined)
 
         return self.dropout(output)
 
@@ -155,7 +155,7 @@ class HoloAttentionV2(nn.Module):
         # --- 5. Concatenate & Output ---
         # Flatten H and D back to hd_dim
         out_combined = out_combined.flatten(2)
-        output = self.o_project(out_combined)
+        output = self.o_proj(out_combined)
 
         return self.dropout(output)
                           
@@ -164,30 +164,28 @@ class HoloBlock(nn.Module):
     """
     Standard Transformer Block with LayerScale for deep signal propagation.
     """
-    def __init__(self, config, use_version = 2):
+    def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.hidden_size)
+        self.ln1 = nn.LayerNorm(config.d_model)
         
-        if use_version == 2:
+        if config.use_version == 2:
             self.attn = HoloAttentionV2(config)
-        elif use_version == 1:
+        elif config.use_version == 1:
             self.attn = HoloAttentionV1(config)
         else:
             raise ValueError(f"Does not support this version: {use_version}")
             
-        self.ln2 = nn.LayerNorm(config.hidden_size)
+        self.ln2 = nn.LayerNorm(config.d_model)
         
         self.mlp = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * config.expansion_factor),
+            nn.Linear(config.d_model, config.d_model * config.expansion_factor),
             nn.GELU(),
-            nn.Linear(config.d_model * config.expansion_factor, config.d_model),
-            nn.Dropout(config.dropout)
-            nn.Linear(config.hidden_size * config.expansion_factor, config.hidden_size)
+            nn.Linear(config.d_model * config.expansion_factor, config.d_model),     
         )
         
         # LayerScale: Initialize to small value (0.1) to ease optimization
-        self.gamma1 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
-        self.gamma2 = nn.Parameter(torch.ones(config.hidden_size) * 0.1)
+        self.gamma1 = nn.Parameter(torch.ones(config.d_model) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(config.d_model) * 0.1)
 
     def forward(self, x):
         # Residual connection 1 (Mixer)

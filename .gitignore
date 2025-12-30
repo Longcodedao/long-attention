@@ -2,7 +2,9 @@
 .ipynb_checkpoints/*
 
 bench_temp/
-benchmarks/
+benchmarks/zoology/
+benchmarks/.ipynb_checkpoints/
+
 checkpoints/
 results_GPT2/
 results_Holo/
@@ -15,3 +17,6 @@ model/.ipynb_checkpoints/
 model/.ipynb_checkpoints/* 
 model/__pycache__/
 model/__pycache__/*
+
+long_attention.egg-info
+build/

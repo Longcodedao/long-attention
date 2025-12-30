@@ -16,6 +16,7 @@ class HoloConfig(PretrainedConfig):
         max_position_embeddings=8192,
         layer_norm_eps=1e-5,
         initializer_range=0.02,
+        use_version = 1,
         dropout = 0.0,
         pad_token_id=0,
         bos_token_id=1,
@@ -57,6 +58,7 @@ class HoloConfig(PretrainedConfig):
             raise ValueError(f"hd_dim {self.hd_dim} must be divisible by num_heads {num_heads}")
             
         self.head_dim = self.hd_dim // num_heads
+        self.use_version = use_version
         
         super().__init__(
             pad_token_id=pad_token_id,
@@ -64,3 +66,42 @@ class HoloConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs,
         )
+
+    @classmethod
+    def from_preset(cls, size="small", **kwargs):
+        """
+        Factory method for standard Holo sizes.
+        """
+        size = size.lower()
+        
+        # 1. Holo-Small (~125M Params) - Comparable to GPT-2 Small
+        if size == "small":
+            return cls(
+                d_model=768,
+                num_hidden_layers=12,
+                num_heads=12,
+                holo_expansion_ratio=4, # Reduced slightly to keep it lightweight
+                **kwargs
+            )
+            
+        # 2. Holo-Medium (~350M Params) - Comparable to GPT-2 Medium
+        elif size == "medium":
+            return cls(
+                d_model=1024,
+                num_hidden_layers=24,
+                num_heads=16,
+                holo_expansion_ratio=8, # Full holographic fidelity
+                **kwargs
+            )
+
+        # 3. Holo-Large (~770M Params) - Comparable to GPT-2 Large
+        elif size == "large":
+            return cls(
+                d_model=1280,
+                num_hidden_layers=36,
+                num_heads=20,
+                holo_expansion_ratio=8, 
+                **kwargs
+            )
+        else:
+            raise ValueError("Size must be 'small', 'medium', or 'large'")

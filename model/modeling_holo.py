@@ -4,10 +4,15 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from .configuration_holo import HoloConfig
 from .layers import HoloBlock
+from transformers.modeling_utils import ModuleUtilsMixin
+
 
 class HoloPreTrainedModel(PreTrainedModel):
     config_class = HoloConfig
     base_model_prefix = "holo"
+
+    supports_gradient_checkpointing = True
+    
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -22,10 +27,13 @@ class HoloPreTrainedModel(PreTrainedModel):
 class HoloModel(HoloPreTrainedModel):
     def __init__(self, config: HoloConfig):
         super().__init__(config)
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.wte = nn.Embedding(config.vocab_size, config.d_model)
         self.drop = nn.Dropout(0.0)
         self.h = nn.ModuleList([HoloBlock(config) for _ in range(config.num_hidden_layers)])
-        self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+
+        # Initialize checkpointing flag to False by default
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self): 
@@ -40,7 +48,24 @@ class HoloModel(HoloPreTrainedModel):
         hidden_states = self.drop(inputs_embeds)
         
         for block in self.h:
-            hidden_states = block(hidden_states)
+            if self.gradient_checkpointing and self.training:
+                # --- CHECKPOINTING LOGIC ---
+                # We wrap the block call in the checkpoint function.
+                # Note: `use_reentrant=False` is generally recommended for modern PyTorch.
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                    
+                # The `_gradient_checkpointing_func` is automatically set by the Trainer 
+                # or manually by model.gradient_checkpointing_enable()
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    use_reentrant=False
+                )
+            else:
+                hidden_states = block(hidden_states)
             
         hidden_states = self.ln_f(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states)
@@ -50,7 +75,7 @@ class HoloForCausalLM(HoloPreTrainedModel):
     def __init__(self, config: HoloConfig):
         super().__init__(config)
         self.holo = HoloModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.holo.wte.weight
         self.post_init()
