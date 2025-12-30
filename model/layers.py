@@ -98,7 +98,7 @@ class HoloAttentionV2(nn.Module):
         self.o_proj = nn.Linear(self.hd_dim, self.d_model, bias=False)
         
 
-        self.register_buffer("freqs", generate_random_phasors(self.num_heads, self.head_dim))
+        self.register_buffer("freqs", generate_multiscale_phasors(self.num_heads, self.head_dim))
 
         # 3. Multi-Head Gating
         # Each head gets its own [Positional, Associative] weighting
@@ -132,6 +132,9 @@ class HoloAttentionV2(nn.Module):
         # --- 2. Path A: Positional (Time) ---
         # Rotors are computed per-head based on their specific frequencies
         rotors = compute_rotors(T, self.freqs)
+
+        # print(f"v.shape: {v.shape}")
+        # print(f"rotors.shape: {rotors.shape}")
         mem_pos = holo_bind_and_accumulate(v, rotors)
         out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
 
