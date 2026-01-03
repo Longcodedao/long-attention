@@ -46,7 +46,8 @@ class HoloModel(HoloPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
         hidden_states = self.drop(inputs_embeds)
-        
+
+        # print("Hidden States shape: ", hidden_states.shape)
         for block in self.h:
             if self.gradient_checkpointing and self.training:
                 # --- CHECKPOINTING LOGIC ---
