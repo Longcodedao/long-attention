@@ -52,7 +52,7 @@ class HoloConfig(PretrainedConfig):
         if hd_dim is None:
             self.hd_dim = d_model * holo_expansion_ratio
         else:
-            self.hd_dim = d_model
+            self.hd_dim = hd_dim
             
         if self.hd_dim % num_heads != 0:
             raise ValueError(f"hd_dim {self.hd_dim} must be divisible by num_heads {num_heads}")
@@ -74,7 +74,7 @@ class HoloConfig(PretrainedConfig):
         """
         size = size.lower()
         
-        # 1. Holo-Small (~125M Params) - Comparable to GPT-2 Small
+        # 1. Holo-Small - Comparable to GPT-2 Small
         if size == "small":
             return cls(
                 d_model=768,
@@ -84,7 +84,7 @@ class HoloConfig(PretrainedConfig):
                 **kwargs
             )
             
-        # 2. Holo-Medium (~350M Params) - Comparable to GPT-2 Medium
+        # 2. Holo-Medium - Comparable to GPT-2 Medium
         elif size == "medium":
             return cls(
                 d_model=1024,
@@ -94,7 +94,7 @@ class HoloConfig(PretrainedConfig):
                 **kwargs
             )
 
-        # 3. Holo-Large (~770M Params) - Comparable to GPT-2 Large
+        # 3. Holo-Large  - Comparable to GPT-2 Large
         elif size == "large":
             return cls(
                 d_model=1280,

@@ -20,3 +20,8 @@ model/__pycache__/*
 
 long_attention.egg-info
 build/
+
+holo_checkpoints/
+holo_final_model/
+__pycache__/
+holo_final_model.zip
