@@ -38,21 +38,27 @@ def get_dataloader(console, accelerator, dataset_name, batch_size,
     tokenizer = get_tokenizer()
     raw_dataset = load_data_source(dataset_name, split)
     
-    # --- CONDITIONAL SHARDING LOGIC ---
-    # We only shard if it's the 'train' split. 
-    # Valid/Test will be replicated across all GPUs to ensure perfect synchronization.
+    # --- CRITICAL FIX: Only shard the TRAIN split ---
+    # We purposefully do NOT shard the 'test' or 'validation' splits.
+    # This forces every GPU to process the exact same test data.
+    # This guarantees that all GPUs run the EXACT same number of batches, 
+    # preventing the loop-exit deadlock.
     if isinstance(raw_dataset, IterableDataset) and accelerator.num_processes > 1:
         if split == "train":
-            if accelerator.is_main_process:
-                console.print(f"[dim]Sharding '{split}' split for {accelerator.num_processes} GPUs...[/dim]")
-            raw_dataset = raw_dataset.shard(
-                num_shards=accelerator.num_processes,
-                index=accelerator.process_index
-            )
+            try:
+                raw_dataset = raw_dataset.shard(
+                    num_shards=accelerator.num_processes,
+                    index=accelerator.process_index
+                )
+                if accelerator.is_main_process:
+                    console.print(f"[dim]Successfully sharded '{split}' split.[/dim]")
+            except IndexError:
+                if accelerator.is_main_process:
+                    console.print(f"[yellow]Warning: Could not shard '{split}'. Falling back to replication.[/yellow]")
         else:
+            # For Test/Validation
             if accelerator.is_main_process:
-                console.print(f"[dim]Skipping sharding for '{split}' split (replicating data across GPUs).[/dim]")
-
+                console.print(f"[dim]Skipping sharding for '{split}' to ensure lockstep evaluation.[/dim]")                
     # --- Auto-detect Column Name ---
     # SlimPajama uses "text", but custom datasets might use "content"
     try:
