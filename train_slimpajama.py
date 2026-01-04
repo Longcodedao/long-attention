@@ -49,11 +49,11 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for scheduler")
     parser.add_argument("--save_steps", type=int, default=200, help="Steps interval for saving checkpoints")
     parser.add_argument("--eval_steps", type=int, default=10, help="Run evaluation every X steps")
-    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     
     # Model Configuration
     parser.add_argument("--model_size", type=str, default="small", choices=["small", "small+", "medium", "medium+", "large", "large+"], help="Holo model preset")
-    
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")    
+
     # Checkpointing
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './holo_checkpoints/step_500')")
     parser.add_argument("--output_dir", type=str, default="./holo_checkpoints", help="Directory to save checkpoints")
@@ -103,6 +103,17 @@ val_loader, _ = data_loader.get_dataloader(
 
 config = HoloConfig.from_preset(args.model_size, use_version=2)
 model = HoloForCausalLM(config)
+
+# --- ADD THIS BLOCK ---
+if args.gradient_checkpointing:
+    # This method is standard in Hugging Face PreTrainedModel
+    # It tells the model to not store intermediate activations
+    model.gradient_checkpointing_enable()
+    
+    # If using a custom model that doesn't inherit from PreTrainedModel, 
+    # you might need config.use_cache = False as well
+    if hasattr(config, "use_cache"):
+        config.use_cache = False
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
 scheduler = get_cosine_schedule_with_warmup(
@@ -219,7 +230,7 @@ progress_bar = utils.create_progress_bar()
 
 if accelerator.is_main_process:
     # Initialize TensorBoard with dynamic config
-    accelerator.init_trackers("holo_logs", config=vars(args))    
+    accelerator.init_trackers(args.log_dir, config=vars(args))    
     train_task_id = progress_bar.add_task("[green]Training...", total=args.max_steps)
     live = Live(
         console=console, 
