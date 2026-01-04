@@ -7,10 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.12.0",
     "datasets>=4.4.2",
+    "ipykernel>=7.1.0",
     "rich>=14.2.0",
     "tensorboard>=2.20.0",
     "torchmetrics>=1.8.2",
+    "tqdm[notebook]>=4.67.1",
     "transformers>=4.57.3",
     "wandb>=0.23.1",
 ]
 
+[tool.uv]
+package = false

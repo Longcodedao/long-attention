@@ -49,9 +49,10 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for scheduler")
     parser.add_argument("--save_steps", type=int, default=200, help="Steps interval for saving checkpoints")
     parser.add_argument("--eval_steps", type=int, default=10, help="Run evaluation every X steps")
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     
     # Model Configuration
-    parser.add_argument("--model_size", type=str, default="small", choices=["small", "medium", "large"], help="Holo model preset")
+    parser.add_argument("--model_size", type=str, default="small", choices=["small", "small+", "medium", "medium+", "large", "large+"], help="Holo model preset")
     
     # Checkpointing
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './holo_checkpoints/step_500')")
@@ -67,7 +68,7 @@ args = parse_args()
 # ===============================
 accelerator = Accelerator(
     gradient_accumulation_steps=args.grad_accum_steps,
-    mixed_precision="bf16",
+    # mixed_precision=args.mixed_precision,
     log_with="tensorboard",
     project_dir="."
 )

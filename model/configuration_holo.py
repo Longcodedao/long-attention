@@ -83,7 +83,6 @@ class HoloConfig(PretrainedConfig):
                 holo_expansion_ratio=4, # Reduced slightly to keep it lightweight
                 **kwargs
             )
-            
         # 2. Holo-Medium - Comparable to GPT-2 Medium
         elif size == "medium":
             return cls(
@@ -101,6 +100,35 @@ class HoloConfig(PretrainedConfig):
                 num_hidden_layers=36,
                 num_heads=20,
                 holo_expansion_ratio=8, 
+                **kwargs
+            )
+            
+        # UPDATED: Holo-Small+ (344.35M)
+        elif size == "small+":
+            return cls(
+                d_model = 796,
+                num_hidden_layers = 24,
+                num_heads = 16, 
+                holo_expansion_ratio = 4,
+                expansion_factor = 4,
+                **kwargs
+            )
+        elif size == "medium+":
+            return cls(
+                d_model = 2048,
+                num_hidden_layers = 32,
+                num_heads = 32, 
+                holo_expansion_ratio = 4,
+                expansion_factor = 4,
+                **kwargs
+            )
+        elif size == "large+":
+            return cls(
+                d_model = 3072,
+                num_hidden_layers = 40,
+                num_heads = 32, 
+                holo_expansion_ratio = 4,
+                expansion_factor = 4,
                 **kwargs
             )
         else:
