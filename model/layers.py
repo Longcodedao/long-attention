@@ -89,6 +89,7 @@ class HoloAttentionV2(nn.Module):
             mem_pos = holo_bind_and_accumulate(v, rotors)
             out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
         else:
+            # print('Use Triton Kernel') 
             rotors_conj = torch.conj(rotors).resolve_conj()
             out_pos = holo_fused_step(v, rotors, rotors_conj)
             # out_pos = self.fused_pos_step(v, rotors, torch.conj(rotors))
@@ -116,10 +117,16 @@ class HoloAttentionV2(nn.Module):
         # --- 5. Concatenate & Output ---
         # Flatten H and D back to hd_dim
         out_combined = out_combined.flatten(2)
+        
+        # === FIX IS HERE ===
+        # Cast to match the weight dtype (BFloat16) before projection
+        out_combined = out_combined.to(self.o_proj.weight.dtype)
+        
         output = self.o_proj(out_combined)
 
         return self.dropout(output)
-                          
+
+        
 
 class HoloBlock(nn.Module):
     """

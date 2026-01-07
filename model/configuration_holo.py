@@ -16,7 +16,7 @@ class HoloConfig(PretrainedConfig):
         max_position_embeddings=8192,
         layer_norm_eps=1e-5,
         initializer_range=0.02,
-        use_version = 1,     # Use version 1 for 29/12 version, 2 for 30/12
+        use_version = 2,     
         dropout = 0.0,
         pad_token_id=0,
         bos_token_id=1,
