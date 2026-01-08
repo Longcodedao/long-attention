@@ -9,6 +9,7 @@ dependencies = [
     "datasets>=4.4.2",
     "deepspeed>=0.18.3",
     "ipykernel>=7.1.0",
+    "lm-eval>=0.4.9.2",
     "matplotlib>=3.10.8",
     "rich>=14.2.0",
     "tensorboard>=2.20.0",
