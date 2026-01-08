@@ -16,7 +16,7 @@ def load_data_source(name, split):
     # 1. The Small 6B Version -> DOWNLOAD IT (streaming=False)
     # This allows global shuffling and faster training after the initial download.
     if name == "slimpajama_6b":
-        return load_dataset("DKYoon/SlimPajama-6B", split=split, streaming=False)
+        return load_dataset("DKYoon/SlimPajama-6B", split=split, streaming=True)
     
     # 2. The Full 627B Version (Massive - requires streaming)
     elif name == "slimpajama_627b":
@@ -33,9 +33,6 @@ def load_data_source(name, split):
 
 def get_dataloader(console, accelerator, dataset_name, batch_size, 
                    seq_len=2048, split="train", num_workers=4, prefetch_factor=2):
-    """
-    The MAIN entry point. Optimized for distributed training stability.
-    """
     
     if accelerator.is_main_process:
         console.print(f"[Dataset] Loading '{dataset_name}' (Split: {split})...")
@@ -43,62 +40,58 @@ def get_dataloader(console, accelerator, dataset_name, batch_size,
     tokenizer = get_tokenizer()
     raw_dataset = load_data_source(dataset_name, split)
     
-    # --- Tokenization Logic ---
+    # 1. SHUFFLE (Training Only)
+    # Essential for streaming datasets to break correlation
+    if split == "train":
+        # Buffer size depends on RAM. 10,000 is a safe starting point.
+        raw_dataset = raw_dataset.shuffle(seed=42, buffer_size=10_000)
+
+    # 2. SHARDING (Training Only)
+    if isinstance(raw_dataset, IterableDataset) and accelerator.num_processes > 1:
+        if split == "train":
+            raw_dataset = raw_dataset.shard(
+                num_shards=accelerator.num_processes,
+                index=accelerator.process_index
+            )
+    
+    # 3. DYNAMIC COLUMN DETECTION
+    # Peek at the first item to know exactly what columns to remove
+    try:
+        sample = next(iter(raw_dataset))
+        # Detect text column if not standard
+        text_column = "text" if "text" in sample else list(sample.keys())[0]
+        # remove ALL columns that existed in the raw data
+        remove_cols = list(sample.keys()) 
+    except StopIteration:
+        # Handle empty dataset edge case
+        text_column = "text"
+        remove_cols = ["text", "meta", "red_pajama_subset"]
+
+    # 4. TOKENIZATION
     def tokenization_fn(examples):
         return tokenizer(
-            examples["text"], # SlimPajama-6B uses "text" column
+            examples[text_column],
             truncation=True,
             max_length=seq_len,
             padding="max_length",
         )
 
-    # --- Pre-Processing & Tokenization ---
-    if not isinstance(raw_dataset, IterableDataset):
-        # === CRITICAL FIX: Prevent Deadlocks ===
-        # We use accelerator.main_process_first() to force Rank 0 to do the heavy lifting
-        # (downloading & tokenizing & caching) while other ranks wait.
-        # Once Rank 0 is done, the data is cached on disk.
-        # Ranks 1+ then wake up and instantly load the cache (0s duration).
-        with accelerator.main_process_first():
-            
-            # Print only on main process to keep logs clean
-            if accelerator.is_main_process:
-                console.print(f"[yellow]Tokenizing {split} dataset... (This runs once & caches)[/yellow]")
-            
-            # Map with full CPU parallelism
-            # NOTE: We use os.cpu_count() because inside this block, 
-            # only ONE process is running, so we can hog all the cores safely.
-            mapped_ds = raw_dataset.map(
-                tokenization_fn,
-                batched=True,
-                num_proc=os.cpu_count(), 
-                remove_columns=raw_dataset.column_names,
-                desc=f"Tokenizing {split}",
-                load_from_cache_file=True # Uses disk cache if available
-            )
-            
-        mapped_ds = mapped_ds.with_format("torch")
-        
-        # True Global Shuffle for downloaded datasets
-        should_shuffle = (split == "train")
-        
-    else:
-        # Fallback for Streaming Datasets (like 627B)
-        # We cannot use main_process_first here because streaming happens on the fly.
-        mapped_ds = raw_dataset.map(tokenization_fn, remove_columns=["text", "meta", "red_pajama_subset"])
-        mapped_ds = mapped_ds.with_format("torch")
-        should_shuffle = False # Streaming datasets shuffle via buffer, not here
+    # 5. BATCHED MAPPING (Critical for Speed)
+    mapped_ds = raw_dataset.map(
+        tokenization_fn, 
+        batched=True,           # <--- ENABLES FAST RUST TOKENIZATION
+        batch_size=1000,        # Process 1k texts at a time
+        remove_columns=remove_cols
+    )
+    mapped_ds = mapped_ds.with_format("torch")
 
-    # --- Create DataLoader ---
     return DataLoader(
         mapped_ds,
         batch_size=batch_size,
-        shuffle=should_shuffle, 
         num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor
+        prefetch_factor=prefetch_factor,
+        pin_memory=True
     ), tokenizer
-
 
 # def get_dataloader(console, accelerator, dataset_name, batch_size, 
 #                    seq_len=2048, split="train", num_workers=4, prefetch_factor=2):
