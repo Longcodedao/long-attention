@@ -121,8 +121,8 @@ scheduler = get_cosine_schedule_with_warmup(
 )
 
 # Prepare with Accelerator
-model, optimizer, train_loader, scheduler = accelerator.prepare(
-    model, optimizer, train_loader, scheduler
+model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, val_loader, scheduler
 )
 
 # Metrics
@@ -351,7 +351,10 @@ try:
                 if accelerator.is_main_process:
                     system_message = f"[bold yellow]Saving checkpoint to step_{global_step}...[/bold yellow]"                    
                     live.update(Group(metrics_panel, val_panel, Panel(system_message, border_style="yellow"), progress_bar))
-                    accelerator.save_state(f"{args.output_dir}/step_{global_step}")
+                    
+                accelerator.save_state(f"{args.output_dir}/step_{global_step}")
+                
+                if accelerator.is_main_process:
                     system_message = None
                     
                 accelerator.wait_for_everyone()
@@ -380,7 +383,14 @@ try:
         unwrapped_model = accelerator.unwrap_model(model)
         
         final_save_path = "./holo_final_model"
-        unwrapped_model.save_pretrained(final_save_path, safe_serialization=False)
+        
+        unwrapped_model.save_pretrained(
+            final_save_path, 
+            is_main_process=accelerator.is_main_process, 
+            save_function=accelerator.save,
+            safe_serialization=False
+        )
+        
         tokenizer.save_pretrained(final_save_path)
         
         # 2. Final Results Summary Table

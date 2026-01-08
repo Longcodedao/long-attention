@@ -5,74 +5,10 @@ from .functional import (
     generate_random_phasors,
     compute_rotors, 
     holo_bind_and_accumulate, 
-    holo_retrieve
+    holo_retrieve,
+    holo_fused_step
 )
 
-
-class HoloAttentionV1(nn.Module):
-    """
-    The Holographic 'Attention' Mechanism (v7 Production).
-    Features:
-    1. Dual-Path: Positional (Indexing) + Associative (Recall).
-    2. Shared Q/K: Forces instant alignment for associative recall.
-    3. Gated Mixing: Learnable balance between Time and Content.
-    4. Phase Scaling: High-variance initialization for orthogonality.
-    """
-    def __init__(self, config):
-        super().__init__()
-        self.d_model = config.d_model
-        self.hd_dim = config.hd_dim
-        self.phase_scale = config.phase_scale
-
-        # 1. Projections (Real -> Complex)
-        # We project inputs into the Holographic "Hyper-Dimension"        
-        self.v_proj = nn.Linear(self.d_model, self.hd_dim, bias=False)
-        self.k_proj = nn.Linear(self.d_model, self.hd_dim, bias=False) # Shared Q/K
-        self.o_proj = nn.Linear(self.hd_dim, self.d_model, bias=False)
-        
-        # Fixed Positional Phasors
-        self.register_buffer("freqs", generate_random_phasors(self.hd_dim))
-        
-        # Learnable Gate (Initialize balanced)
-        self.gate = nn.Parameter(torch.tensor([0.5, 0.5]))
-
-
-        self.dropout = nn.Dropout(p = config.dropout)
-
-    
-    def forward(self, x): 
-        B, T, C = x.shape
-        
-        # 1. Values
-        k_real = self.k_proj(x)
-        v_real = self.v_proj(x)
-
-        v = v_real.to(torch.complex64)
-        
-        # 2. Keys (Scaled for Orthogonality)
-        k_angle = k_real * self.phase_scale
-        k = torch.exp(1j * k_angle) 
-        q = k # Shared Q/K
-        
-        # 3. Path A: Positional Memory (Indexing)
-        rotors = compute_rotors(T, self.freqs)
-        mem_pos = holo_bind_and_accumulate(v, rotors)
-        out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
-        
-        # 4. Path B: Associative Memory (Recall)
-        k_shifted = torch.roll(k, shifts=1, dims=1)
-        k_shifted[:, 0, :] = 0 # Zero out first token history
-        
-        mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
-        out_assoc = holo_retrieve(mem_assoc, q)
-        
-        # 5. Gated Merge
-        out_combined = (out_pos * self.gate[0]) + (out_assoc * self.gate[1])
-        output = self.o_proj(out_combined)
-
-        return self.dropout(output)
-
-        
 
 class HoloAttentionV2(nn.Module):
     """
@@ -85,6 +21,7 @@ class HoloAttentionV2(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.d_model = config.d_model
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
@@ -109,6 +46,17 @@ class HoloAttentionV2(nn.Module):
         )
 
         self.dropout = nn.Dropout(p = config.dropout)
+
+    # Compile this specific math heavy static function
+    @torch.compile(mode="max-autotune")
+    def fused_pos_step(self, v, k, q):
+        # This looks simple, but torch.compile optimizes the memory access
+        # better than a naive triton loop for cumulative sums
+        bind = v * k
+        mem = torch.cumsum(bind, dim=1)
+        # Retrieve
+        scale = torch.sqrt(torch.arange(1, v.size(1) + 1, device=v.device)).view(1, -1, 1, 1)
+        return (mem * q).real / scale
     
     def forward(self, x): 
         B, T, C = x.shape
@@ -125,27 +73,38 @@ class HoloAttentionV2(nn.Module):
         # Keys (Scaled for Orthogonality)
 
         k_angle = k_real * self.phase_scale
-        k = torch.exp(1j * k_angle) 
+        k = torch.exp(1j * k_angle)
         q = k # Shared Q/K
         
 
         # --- 2. Path A: Positional (Time) ---
         # Rotors are computed per-head based on their specific frequencies
-        rotors = compute_rotors(T, self.freqs)
-
+        rotors = compute_rotors(T, self.freqs).expand(B, -1, -1, -1)
+        
         # print(f"v.shape: {v.shape}")
         # print(f"rotors.shape: {rotors.shape}")
-        mem_pos = holo_bind_and_accumulate(v, rotors)
-        out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
-
+        # mem_pos = holo_bind_and_accumulate(v, rotors)
+        # out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
+        if self.config.use_version == 1:
+            mem_pos = holo_bind_and_accumulate(v, rotors)
+            out_pos = holo_retrieve(mem_pos, torch.conj(rotors))
+        else:
+            # print('Use Triton Kernel') 
+            rotors_conj = torch.conj(rotors).resolve_conj()
+            out_pos = holo_fused_step(v, rotors, rotors_conj)
+            # out_pos = self.fused_pos_step(v, rotors, torch.conj(rotors))
+            
         # --- 3. Path B: Associative (Content) ---
         # Shift K along the Time axis
-
         k_shifted = torch.roll(k, shifts=1, dims=1)
-        k_shifted[:, 0, :] = 0 # Zero out first token history
-        
-        mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
-        out_assoc = holo_retrieve(mem_assoc, q)
+        k_shifted[:, 0, :] = 0 # Zero out first token history        
+        if self.config.use_version == 1:
+            mem_assoc = holo_bind_and_accumulate(v, torch.conj(k_shifted))
+            out_assoc = holo_retrieve(mem_assoc, q)
+        else:
+            k_shifted_conj = torch.conj(k_shifted).resolve_conj()
+            out_assoc = holo_fused_step(v, k_shifted_conj, q)
+            # out_assoc = self.fused_pos_step(v, torch.conj(k_shifted), q)
         
         # --- 4. Gated Merge (Per Head) ---
         # gate[:, 0] is Positional weight, gate[:, 1] is Associative weight
@@ -158,10 +117,16 @@ class HoloAttentionV2(nn.Module):
         # --- 5. Concatenate & Output ---
         # Flatten H and D back to hd_dim
         out_combined = out_combined.flatten(2)
+        
+        # === FIX IS HERE ===
+        # Cast to match the weight dtype (BFloat16) before projection
+        out_combined = out_combined.to(self.o_proj.weight.dtype)
+        
         output = self.o_proj(out_combined)
 
         return self.dropout(output)
-                          
+
+        
 
 class HoloBlock(nn.Module):
     """
@@ -170,14 +135,7 @@ class HoloBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.d_model)
-        
-        if config.use_version == 2:
-            self.attn = HoloAttentionV2(config)
-        elif config.use_version == 1:
-            self.attn = HoloAttentionV1(config)
-        else:
-            raise ValueError(f"Does not support this version: {use_version}")
-            
+        self.attn = HoloAttentionV2(config)
         self.ln2 = nn.LayerNorm(config.d_model)
         
         self.mlp = nn.Sequential(

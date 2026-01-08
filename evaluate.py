@@ -44,6 +44,8 @@ def parse_args():
     return parser.parse_args()
 
 def main():
+    os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
+    
     args = parse_args()
     
     # Initialize Accelerator
@@ -69,10 +71,9 @@ def main():
         prefetch_factor=None
     )
 
-    # 3. PREPARE MODEL ONLY
-    # CRITICAL FIX: We do NOT prepare the dataloader. 
-    # We will manually move data to GPU to avoid 'accelerate' messing up the sharding logic.
-    model = accelerator.prepare(model)
+    # --- FIX 1: Prepare BOTH Model and Loader ---
+    # DeepSpeed mandates the loader be passed here to infer batch size
+    model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
 
     loss_metric = MeanMetric().to(accelerator.device)
@@ -131,9 +132,6 @@ def main():
                 except StopIteration:
                     break
                 
-                # --- MANUAL MOVE TO DEVICE (Fixes Deadlock) ---
-                batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-
                 # Forward pass
                 outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
                 loss = outputs.loss

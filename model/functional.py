@@ -1,5 +1,6 @@
 import torch
 import math
+from .ops import holo_scan
 
 def generate_multiscale_phasors(num_heads: int, head_dim: int, 
                                 device: torch.device = None) -> torch.Tensor:
@@ -103,3 +104,20 @@ def holo_retrieve(memory_trace: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     
     # Decode and Project to Real
     return (memory_trace * q).real / scale    
+
+
+def holo_fused_step(v: torch.Tensor, k: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """
+    Performs Binding + Accumulation + Retrieval in one fused kernel.
+    
+    Args:
+        v: Value (B, T, H, D) - Complex64
+        k: Key   (B, T, H, D) - Complex64
+        q: Query (B, T, H, D) - Complex64
+        
+    Returns:
+        Output (B, T, H, D) - Float32 (Real part of the projection)
+    """
+    # The kernel handles the accumulation (cumsum), scaling (sqrt(t)), 
+    # and retrieval ((acc * q).real) internally.
+    return holo_scan(v, k, q)
