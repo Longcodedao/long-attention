@@ -31,7 +31,6 @@ def get_model_and_tokenizer(model_type,
     config = None 
 
     if model_type.lower() == "gpt2":
-        print(f"[Model Loader] Initializing Custom GPT-2 ({model_size})...")
         presets = get_gpt2_config_dict(model_size)
         
         config = GPT2Config(
@@ -46,8 +45,6 @@ def get_model_and_tokenizer(model_type,
         model = GPT2LMHeadModel(config)
 
     elif model_type.lower() == "mamba":
-        print(f"[Model Loader] Initializing Mamba ({model_size})...")
-        
         # Fetch preset
         preset = get_mamba_config_dict(model_size)
         
@@ -66,7 +63,6 @@ def get_model_and_tokenizer(model_type,
         model = MambaForCausalLM(config)
         
     elif model_type.lower() == "holo":
-        print(f"[Model Loader] Initializing Holo ({model_size})...")
         config = HoloConfig.from_preset(model_size, use_version=2)
         # Ensure config matches training args
         config.vocab_size = vocab_size 
