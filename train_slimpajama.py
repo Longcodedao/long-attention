@@ -13,8 +13,7 @@ from rich.panel import Panel
 from rich.console import Group
 
 # --- LOCAL IMPORTS ---
-from model.configuration_holo import HoloConfig
-from model.modeling_holo import HoloForCausalLM
+from model import model_loader
 from dataset import data_loader
 import utils
 import datasets
@@ -39,6 +38,12 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="slimpajama_6b", 
                         help="Name of dataset ('slimpajama_6b') or path to local file ('./data/train.jsonl')")
     parser.add_argument("--val_dataset", type=str, default="slimpajama_6b", help="Dataset to use for validation")
+
+    # Model Configuration 
+    parser.add_argument("--model_type", type=str, default="holo", 
+                        choices=["holo", "gpt2", "mamba"], 
+                        help="Type of model to train")
+    parser.add_argument("--model_size", type=str, default="small", help="Model size preset (e.g. small, medium)")
     
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=2, help="Per-device batch size")
@@ -49,14 +54,15 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for scheduler")
     parser.add_argument("--save_steps", type=int, default=200, help="Steps interval for saving checkpoints")
     parser.add_argument("--eval_steps", type=int, default=10, help="Run evaluation every X steps")
-    
-    # Model Configuration
-    parser.add_argument("--model_size", type=str, default="small", choices=["small", "small+", "medium", "medium+", "large", "large+"], help="Holo model preset")
+
+    # Optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")    
 
     # Checkpointing
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './holo_checkpoints/step_500')")
-    parser.add_argument("--output_dir", type=str, default="./holo_checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/holo_small", help="Directory to save checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./output/holo_small", help="Directory to save the final model")
+    
     parser.add_argument("--log_dir", type=str, default="./holo_logs", help="Directory for TensorBoard logs")
     
     return parser.parse_args()
@@ -73,8 +79,11 @@ accelerator = Accelerator(
     project_dir="."
 )
 set_seed(42)
-
 console = utils.get_console(accelerator)
+
+if args.model_type == "mamba" and accelerator.mixed_precision == "no":
+    if accelerator.is_main_process:
+        console.print("[bold red]WARNING: Training Mamba in FP32 (no mixed precision) can be very slow or unstable. Please set --bf16/f16 on accelerate config if possible.[/bold red]")
 
 if accelerator.is_main_process:
     utils.print_config_table(console, accelerator, args)
@@ -82,38 +91,34 @@ if accelerator.is_main_process:
 
 
 # ===============================
-# 3. Load Data & Model
+# 3. Load Model & Tokenizer
 # ===============================
-train_loader, tokenizer = data_loader.get_dataloader(
-    console,
-    accelerator, 
-    args.dataset,
-    args.batch_size, 
-    args.seq_len,
-    split = "train"
-)
-val_loader, _ = data_loader.get_dataloader(
-    console,
-    accelerator, 
-    args.val_dataset,
-    args.batch_size, 
-    args.seq_len,
-    split = "validation"
+# We load the model FIRST to get the tokenizer, which we then pass to the data loader
+model, tokenizer = model_loader.get_model_and_tokenizer(
+    model_type=args.model_type,
+    model_size=args.model_size,
+    seq_len=args.seq_len,
+    device=accelerator.device
 )
 
-config = HoloConfig.from_preset(args.model_size, use_version=2)
-model = HoloForCausalLM(config)
-
-# --- ADD THIS BLOCK ---
+# Apply Gradient Checkpointing if requested
 if args.gradient_checkpointing:
-    # This method is standard in Hugging Face PreTrainedModel
-    # It tells the model to not store intermediate activations
     model.gradient_checkpointing_enable()
-    
-    # If using a custom model that doesn't inherit from PreTrainedModel, 
-    # you might need config.use_cache = False as well
-    if hasattr(config, "use_cache"):
-        config.use_cache = False
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+# ===============================
+# 4. Load Data
+# ===============================
+train_loader = data_loader.get_dataloader(
+    console, accelerator, tokenizer, # <--- Passing tokenizer here
+    args.dataset, args.batch_size, args.seq_len, split="train"
+)
+
+val_loader = data_loader.get_dataloader(
+    console, accelerator, tokenizer, # <--- Passing tokenizer here
+    args.val_dataset, args.batch_size, args.seq_len, split="validation"
+)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
 scheduler = get_cosine_schedule_with_warmup(
@@ -139,7 +144,7 @@ if args.resume_from_checkpoint:
 
     # Automatic 'latest' detection
     if path == "latest":
-        chk_dir = args.output_dir 
+        chk_dir = args.checkpoint_dir
         if os.path.exists(chk_dir):
             folders = [os.path.join(chk_dir, d) for d in os.listdir(chk_dir) if d.startswith("step_")]
             if folders:
@@ -241,10 +246,13 @@ if accelerator.is_main_process:
     live.start()
     
     # Save tokenizer once at start (safe because it doesn't change)
+    if not os.path.exists(args.checkpoint_dir):
+        os.makedirs(args.checkpoint_dir)
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
         
-    tokenizer.save_pretrained(os.path.join(args.output_dir, "tokenizer"))
+    tokenizer.save_pretrained(os.path.join(args.checkpoint_dir, "tokenizer"))
 
 try:
     while global_step < args.max_steps:
@@ -352,7 +360,7 @@ try:
                     system_message = f"[bold yellow]Saving checkpoint to step_{global_step}...[/bold yellow]"                    
                     live.update(Group(metrics_panel, val_panel, Panel(system_message, border_style="yellow"), progress_bar))
                     
-                accelerator.save_state(f"{args.output_dir}/step_{global_step}")
+                accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
                 
                 if accelerator.is_main_process:
                     system_message = None
@@ -382,7 +390,7 @@ try:
         console.print("[bold blue]Saving final model weights...[/bold blue]")
         unwrapped_model = accelerator.unwrap_model(model)
         
-        final_save_path = "./holo_final_model"
+        final_save_path = args.output_dir
         
         unwrapped_model.save_pretrained(
             final_save_path, 

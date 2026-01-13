@@ -3,25 +3,17 @@ import json
 import torch
 import lm_eval
 from lm_eval.models.huggingface import HFLM
-from transformers import AutoTokenizer
-
-# --- IMPORT YOUR CUSTOM MODEL ---
-try:
-    from model.configuration_holo import HoloConfig
-    from model.modeling_holo import HoloForCausalLM
-    HOLO_AVAILABLE = True
-except ImportError:
-    print("Warning: Could not import Holo classes. 'holo' models will fail to load.")
-    HOLO_AVAILABLE = False
-
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
+# --- IMPORT YOUR UNIFIED LOADER ---
+from model.model_loader import load_model_from_path
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Downstream Evaluation Tasks")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model or HF ID")
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "holo"], help="Use 'holo' for your custom model")
+    parser.add_argument("--model_type", type=str, default="holo", choices=["holo", "gpt2", "mamba"], help="Type of model to load")
     parser.add_argument("--tasks", type=str, default="hellaswag,piqa,arc_easy,lambada_openai", help="Comma-separated tasks")
     parser.add_argument("--batch_size", type=str, default="auto", help="Batch size (e.g. '8' or 'auto')")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -39,30 +31,21 @@ def main():
         console.print("[bold red]CRITICAL WARNING: Triton kernels (Holo) CANNOT run on CPU. You must use a GPU.[/bold red]")
         return
 
-    # 1. LOAD MODEL
-    if args.model_type == "holo":
-        if not HOLO_AVAILABLE:
-            console.print("[bold red]Error:[/bold red] You selected --model_type holo but the classes could not be imported.")
-            return
-
-        console.print("[bold cyan]Loading custom Holo model...[/bold cyan]")
+    # 1. LOAD MODEL (Using Unified Loader)
+    try:
+        console.print(f"[bold cyan]Loading {args.model_type.upper()} model...[/bold cyan]")
         
-        # Load Config & Model
-        config = HoloConfig.from_pretrained(args.model_path)
-        model_obj = HoloForCausalLM.from_pretrained(args.model_path, config=config)
+        # This handles Holo, GPT-2, and Mamba automatically
+        model_obj, tokenizer = load_model_from_path(
+            model_type=args.model_type,
+            model_path=args.model_path,
+            device=args.device
+        )
         
-        # --- CRITICAL FIX: MOVE MODEL TO GPU EXPLICITLY ---
-        console.print(f"[dim]Moving model to {args.device}...[/dim]")
-        model_obj.to(args.device)
-        model_obj.eval() # Set to evaluation mode
-        # --------------------------------------------------
+        model_obj.eval() # Ensure evaluation mode
 
-        # Load Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        # Wrap it for lm-eval
+        # 2. WRAP FOR LM-EVAL
+        # HFLM requires a standard HF-style model and tokenizer
         lm_obj = HFLM(
             pretrained=model_obj,
             tokenizer=tokenizer,
@@ -70,27 +53,20 @@ def main():
             device=args.device 
         )
         
-    else:
-        # Standard loading for baselines
-        console.print("[bold cyan]Loading standard HF model...[/bold cyan]")
-        lm_obj = "hf" 
+    except Exception as e:
+        console.print(f"[bold red]Failed to load model:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
-    # 2. RUN EVALUATION
+    # 3. RUN EVALUATION
     try:
-        if args.model_type == "holo":
-             results = lm_eval.simple_evaluate(
-                model=lm_obj, 
-                tasks=task_list,
-                device=args.device
-            )
-        else:
-            results = lm_eval.simple_evaluate(
-                model="hf",
-                model_args=f"pretrained={args.model_path},trust_remote_code=True,dtype=bfloat16",
-                tasks=task_list,
-                batch_size=args.batch_size,
-                device=args.device
-            )
+        console.print("[dim]Starting lm-eval tasks...[/dim]")
+        results = lm_eval.simple_evaluate(
+            model=lm_obj, 
+            tasks=task_list,
+            device=args.device
+        )
 
     except Exception as e:
         console.print(f"[bold red]Error during evaluation:[/bold red] {e}")
@@ -98,7 +74,7 @@ def main():
         traceback.print_exc()
         return
 
-    # 3. FORMAT OUTPUT
+    # 4. FORMAT OUTPUT
     if results is not None:
         table = Table(title=f"Results: {args.model_path}")
         table.add_column("Task", style="cyan")
@@ -111,17 +87,23 @@ def main():
         
         for task_name, metrics in raw_results.items():
             for metric_key, value in metrics.items():
+                # Filter for useful metrics to display in table
                 if any(x in metric_key for x in desired_metrics) and "stderr" not in metric_key and "alias" not in metric_key:
                     stderr_key = metric_key + "_stderr"
                     stderr_val = metrics.get(stderr_key, "N/A")
+                    
                     val_str = f"{value:.4f}" if isinstance(value, float) else str(value)
                     err_str = f"± {stderr_val:.4f}" if isinstance(stderr_val, float) else ""
+                    
                     table.add_row(task_name, metric_key, val_str, err_str)
 
         console.print("\n")
         console.print(table)
+        
+        # Save JSON
         with open(args.output_file, "w") as f:
             json.dump(results, f, indent=2, default=str)
+        console.print(f"[dim]Full results saved to {args.output_file}[/dim]")
 
 if __name__ == "__main__":
     main()

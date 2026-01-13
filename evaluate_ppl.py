@@ -4,6 +4,8 @@ import math
 import torch
 import argparse
 import warnings
+import datasets
+import transformers
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torchmetrics import MeanMetric
@@ -22,80 +24,103 @@ from rich.progress import (
 )
 
 # --- LOCAL IMPORTS ---
-from model.configuration_holo import HoloConfig
-from model.modeling_holo import HoloForCausalLM
+# Ensure these match your file structure
+from model import model_loader
 from dataset import data_loader
 import utils
-import datasets
-import transformers
 
+
+# Disable noisy logging
+datasets.utils.logging.set_verbosity_error()
+transformers.utils.logging.set_verbosity_error()
+
+# ===============================
+# 1. Argument Parsing
+# ===============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Holo Evaluation Script")
-    parser.add_argument("--model_path", type=str, default="./holo_final_model", 
+    parser = argparse.ArgumentParser(description="Multi-Model Evaluation Script (Holo/GPT2/Mamba)")
+    
+    # Model Selection
+    parser.add_argument("--model_type", type=str, default="holo", 
+                        choices=["holo", "gpt2", "mamba"], 
+                        help="Type of model to evaluate")
+    parser.add_argument("--model_path", type=str, default="./output/holo-small", 
                         help="Path to the directory containing the saved model and tokenizer")
-    parser.add_argument("--dataset", type=str, default="slimpajama_6b", 
-                        help="Dataset name or path to local test file")
-    parser.add_argument("--split", type=str, default="test", 
-                        help="Dataset split to evaluate on (usually 'test')")
+    
+    # Dataset
+    parser.add_argument("--dataset", type=str, default="slimpajama_6b", help="Dataset name")
+    parser.add_argument("--split", type=str, default="test", help="Dataset split to evaluate on")
+    
+    # Eval Parameters
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for evaluation")
-    parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length")
+    parser.add_argument("--seq_len", type=int, default=1024, help="Sequence length (must match training)")
     parser.add_argument("--max_eval_batches", type=int, default=100, 
                         help="Cap evaluation at X batches (set to 0 for full dataset)")
+    
     return parser.parse_args()
 
+
+# ===============================
+# 3. Main Execution
+# ===============================
 def main():
-    os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
     
+    # We need to disable DeepSpeed to Evaluate the model
+    os.environ["ACCELERATE_USE_DEEPSPEED"] = "false"
+        
     args = parse_args()
     
     # Initialize Accelerator
-    accelerator = Accelerator(mixed_precision="bf16")
+    # Mamba/Holo often benefit from BF16. FP16 is standard for GPT-2.
+    accelerator = Accelerator(mixed_precision="bf16") 
     set_seed(42)
     
-    # Initialize Rich Console (only on main process to prevent messy overlapping)
+    # Setup Console (Main Process Only)
     console = Console() if accelerator.is_main_process else None
-
-    # 1. Load Model
-    config = HoloConfig.from_pretrained(args.model_path)
-    model = HoloForCausalLM.from_pretrained(args.model_path, config=config)
     
-    # 2. Load Data (Using your robust loader)
-    test_loader, tokenizer = data_loader.get_dataloader(
+    if accelerator.is_main_process:
+        console.rule(f"[bold green]Evaluation: {args.model_type.upper()}[/bold green]")
+        utils.print_config_table(console, accelerator, args)
+
+    # --- Load Model, Tokenizer ---
+    model, tokenizer = model_loader.load_model_from_path(
+        model_type=args.model_type, 
+        model_path=args.model_path, 
+        device=accelerator.device
+    )
+
+    # --- Load Data ---
+    test_loader = data_loader.get_dataloader(
         console if accelerator.is_main_process else None, 
         accelerator, 
+        tokenizer, 
         args.dataset, 
         args.batch_size, 
         args.seq_len,
-        split=args.split, 
-        num_workers=0, 
-        prefetch_factor=None
+        split=args.split,
+        num_workers=2 # slightly faster loading
     )
 
-    # --- FIX 1: Prepare BOTH Model and Loader ---
-    # DeepSpeed mandates the loader be passed here to infer batch size
+    # --- Prepare for Accelerator ---
     model, test_loader = accelerator.prepare(model, test_loader)
     model.eval()
 
     loss_metric = MeanMetric().to(accelerator.device)
 
-    # Determine Total Steps
+    # Determine Steps
     if args.max_eval_batches > 0:
         total_steps = args.max_eval_batches
     else:
-        try:
-            total_steps = len(test_loader)
-        except:
-            total_steps = 100 # Fallback if length is unknown
+        total_steps = len(test_loader)
 
     accelerator.wait_for_everyone()
 
-    # --- UI SETUP (Main Process Only) ---
+    # --- UI Setup ---
     live_display = None
     progress_bar = None
     task_id = None
 
     if accelerator.is_main_process:
-        # Define the Progress Bar
         progress_bar = Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -103,99 +128,87 @@ def main():
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TimeElapsedColumn(),
         )
-        task_id = progress_bar.add_task("[cyan]Evaluating...", total=total_steps)
+        task_id = progress_bar.add_task(f"[cyan]Evaluating {args.model_type}...", total=total_steps)
         
-        # Define the Initial Panel
         status_panel = Panel(
             "Starting Evaluation...", 
-            title="[bold green]Holo Eval[/bold green]", 
+            title=f"[bold green]{args.model_type.upper()} Eval[/bold green]", 
             border_style="green"
         )
-        
-        # Create the Layout Group
-        ui_group = Group(status_panel, progress_bar)
-        
-        # Start Live Display
-        live_display = Live(ui_group, console=console, refresh_per_second=5)
+        live_display = Live(Group(status_panel, progress_bar), console=console, refresh_per_second=5)
         live_display.start()
 
-    # 4. Evaluation Loop
-    # We iterate on the raw loader. Since it wasn't prepared, tensors are on CPU.
+    # --- Evaluation Loop ---
     data_iter = iter(test_loader)
-
+    
     try:
         with torch.no_grad():
             for i in range(total_steps):
-                # Manual Batch Extraction
                 try:
                     batch = next(data_iter)
                 except StopIteration:
                     break
                 
-                # Forward pass
-                outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
+                # --- INPUT MASKING (Critical for GPT-2 / Mamba) ---
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                
+                # Create labels: same as input, but set padding tokens to -100
+                labels = input_ids.clone()
+                labels[attention_mask == 0] = -100
+                
+                # Forward Pass
+                outputs = model(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask, 
+                    labels=labels
+                )
                 loss = outputs.loss
 
-                # GATHER: Syncs all GPUs just to collect the loss
-                # repeated to match batch size for accurate weighting
+                # Gather and Update
                 gathered_losses = accelerator.gather(loss.repeat(args.batch_size))
-                
-                # --- FAST UPDATE (No Sync) ---
-                # We calculate the mean for THIS batch purely for the UI.
-                # .item() pulls the scalar to CPU without triggering a full sync barrier.
-                batch_loss_scalar = gathered_losses.mean().item()
-                
-                # Update the global metric (stores data, does not compute yet)
                 loss_metric.update(gathered_losses)
                 
-                # --- UI UPDATE (Main Process Only) ---
+                # --- UI Update ---
                 if accelerator.is_main_process:
-                    # Calculate PPL for this specific batch
-                    batch_ppl = math.exp(batch_loss_scalar) if batch_loss_scalar < 20 else float("inf")
+                    batch_loss = gathered_losses.mean().item()
+                    batch_ppl = math.exp(batch_loss) if batch_loss < 20 else float("inf")
                     
-                    # Update Panel Text
                     msg = (
                         f"[bold white]Batch:[/bold white] {i+1}/{total_steps}\n"
-                        f"[bold yellow]Current Batch Loss:[/bold yellow] {batch_loss_scalar:.4f}\n"
-                        f"[bold yellow]Current Batch PPL:[/bold yellow]  {batch_ppl:.2f}"
+                        f"[bold yellow]Current Loss:[/bold yellow] {batch_loss:.4f}\n"
+                        f"[bold yellow]Current PPL:[/bold yellow]  {batch_ppl:.2f}"
                     )
-                    new_panel = Panel(msg, title="[bold green]Holo Eval[/bold green]", border_style="green")
-                    
-                    # Update Live Display
+                    new_panel = Panel(msg, title=f"[bold green]{args.model_type.upper()} Eval[/bold green]", border_style="green")
                     live_display.update(Group(new_panel, progress_bar))
                     progress_bar.advance(task_id)
 
     except Exception as e:
-        # Print error cleanly
-        if accelerator.is_local_main_process:
+        if accelerator.is_main_process:
             if live_display: live_display.stop()
             console.print(f"[bold red]Error during evaluation:[/bold red] {e}")
             import traceback
             traceback.print_exc()
-        
+
     finally:
-        # Stop UI
         if accelerator.is_main_process and live_display:
             live_display.stop()
-
-        # Final Barrier
         accelerator.wait_for_everyone()
         
-        # 5. Final Results
-        # NOW it is safe to compute the global metric because the loop is done
+        # --- Final Results ---
         try:
             final_loss = loss_metric.compute().item()
-            final_ppl = math.exp(final_loss) if final_loss < 20 else float("inf")
+            final_ppl = math.exp(min(final_loss, 20)) # clip for overflow
 
             if accelerator.is_main_process:
-                results_table = Table(title="Final Test Results", show_header=True, header_style="bold green")
+                results_table = Table(title="Final Evaluation Results", show_header=True, header_style="bold green")
                 results_table.add_column("Metric", style="cyan")
                 results_table.add_column("Value", style="yellow")
+                results_table.add_row("Model Type", args.model_type.upper())
+                results_table.add_row("Model Path", args.model_path)
                 results_table.add_row("Dataset", args.dataset)
-                results_table.add_row("Split", args.split)
-                results_table.add_row("Sequence Length", str(args.seq_len))
                 results_table.add_row("Final Loss", f"{final_loss:.4f}")
-                results_table.add_row("Final Perplexity", f"{final_ppl:.2f}")
+                results_table.add_row("Final PPL", f"{final_ppl:.2f}")
                 console.print(results_table)
         except Exception as e:
             if accelerator.is_main_process:
