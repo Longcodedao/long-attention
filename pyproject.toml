@@ -3,8 +3,15 @@ name = "long-attention"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12, <3.14"
 dependencies = [
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "torchaudio==2.7.0",
+    "ninja>=1.11.1",
+    "packaging>=23.2",
+    "mamba_ssm==2.2.6.post3",
+    "causal_conv1d==1.5.4",
     "accelerate>=1.12.0",
     "datasets>=4.4.2",
     "deepspeed>=0.18.3",
@@ -25,3 +32,39 @@ dependencies = [
 
 [tool.uv]
 package = false
+build-constraint-dependencies = ["torch==2.7.0", "ninja", "packaging"]
+
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true 
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+# --- SMART FALLBACK LOGIC ---
+# Strategy: Use specific markers to direct Linux Users to Wheels, and everyone else to Git.
+
+causal-conv1d = [
+    # PATH A: Binary Wheels (Linux x86_64 ONLY) - ABI=True
+    { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'" },
+    { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'" },
+    { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.7cxx11abiTRUE-cp313-cp313-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.13'" },
+    
+    # PATH B: Fallback to Source (Mac, Windows, or ARM Linux)
+    { git = "https://github.com/Dao-AILab/causal-conv1d/", tag = "v1.5.4", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" }
+]
+
+mamba-ssm = [
+    # PATH A: Binary Wheels (Linux x86_64 ONLY) - ABI=True
+    { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'" },
+    { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'" },
+    { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3+cu12torch2.7cxx11abiTRUE-cp313-cp313-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.13'" },
+
+    # PATH B: Fallback to Source (Mac, Windows, or ARM Linux)
+    { git = "https://github.com/state-spaces/mamba", tag = "v2.2.6.post3", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" }
+]
+
