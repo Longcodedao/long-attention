@@ -5,7 +5,9 @@ from transformers import (
     GPT2LMHeadModel, 
     AutoTokenizer, 
     MambaConfig,        # Added missing import
-    MambaForCausalLM    # Added missing import
+    MambaForCausalLM,    # Added missing import
+    Mamba2Config, 
+    Mamba2ForCausalLM
 )
 
 # Adjust these imports if your folder structure is slightly different
@@ -13,6 +15,8 @@ from model.holo.configuration_holo import HoloConfig
 from model.holo.modeling_holo import HoloForCausalLM 
 from model.gpt2.gpt2_configs import get_gpt2_config_dict
 from model.mamba.mamba_configs import get_mamba_config_dict
+from model.mamba.mamba2_configs import get_mamba2_config_dict
+
 
 def get_model_and_tokenizer(model_type, 
                             model_size, 
@@ -61,6 +65,41 @@ def get_model_and_tokenizer(model_type,
             eos_token_id=tokenizer.eos_token_id,
         )
         model = MambaForCausalLM(config)
+
+    elif model_type.lower() == "mamba2":
+        print(f"[Model Loader] Initializing Mamba2 ({model_size})...")
+        
+        # 2. Fetch Mamba 2 specific preset
+        preset = get_mamba2_config_dict(model_size) 
+        
+        # --- CRITICAL CALCULATION FOR MAMBA-2 ---
+        # Mamba-2 requires explicitly setting 'num_heads' to match (hidden_size * expand)
+        hidden_size = preset["hidden_size"]
+        expand = preset.get("expand", 2)
+        head_dim = preset.get("head_dim", 64)
+        
+        expanded_dim = hidden_size * expand
+        if expanded_dim % head_dim != 0:
+            raise ValueError(f"Config Error: Expanded dimension {expanded_dim} is not divisible by head_dim {head_dim}")
+        
+        num_heads = expanded_dim // head_dim
+        # ----------------------------------------
+        
+        config = Mamba2Config(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            num_hidden_layers=preset["num_hidden_layers"],
+            state_size=preset.get("state_size", 128), # Default 128 for v2
+            expand=expand,
+            conv_kernel=preset.get("conv_kernel", 4),
+            n_groups=preset.get("n_groups", 1),
+            head_dim=head_dim,
+            num_heads=num_heads, # Passed explicitly
+            pad_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        model = Mamba2ForCausalLM(config)
         
     elif model_type.lower() == "holo":
         config = HoloConfig.from_preset(model_size, use_version=2)
@@ -113,9 +152,16 @@ def load_model_from_path(model_type, model_path, device="cpu"):
             model = MambaForCausalLM.from_pretrained(model_path)
         except Exception as e:
              raise ValueError(f"Failed to load Mamba model from {model_path}. Error: {e}")
-             
+
+    elif model_type.lower() == "mamba2":
+        try:
+            # Mamba2 usually loads fine with AutoModel or specific class
+            model = Mamba2ForCausalLM.from_pretrained(model_path)
+        except Exception as e:
+             raise ValueError(f"Failed to load Mamba2 model from {model_path}. Error: {e}")
+    
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'gpt2', 'mamba', or 'holo'.")
+        raise ValueError(f"Unknown model_type: {model_type}. Choose 'gpt2', 'mamba', 'mamba2', or 'holo'.")
 
     model.to(device)
     return model, tokenizer

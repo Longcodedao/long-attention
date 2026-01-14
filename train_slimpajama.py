@@ -41,7 +41,7 @@ def parse_args():
 
     # Model Configuration 
     parser.add_argument("--model_type", type=str, default="holo", 
-                        choices=["holo", "gpt2", "mamba"], 
+                        choices=["holo", "gpt2", "mamba", "mamba2"], 
                         help="Type of model to train")
     parser.add_argument("--model_size", type=str, default="small", help="Model size preset (e.g. small, medium)")
     

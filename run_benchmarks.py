@@ -13,7 +13,7 @@ from model.model_loader import load_model_from_path
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Downstream Evaluation Tasks")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model or HF ID")
-    parser.add_argument("--model_type", type=str, default="holo", choices=["holo", "gpt2", "mamba"], help="Type of model to load")
+    parser.add_argument("--model_type", type=str, default="holo", choices=["holo", "gpt2", "mamba", "mamba2"], help="Type of model to load")
     parser.add_argument("--tasks", type=str, default="hellaswag,piqa,arc_easy,lambada_openai", help="Comma-separated tasks")
     parser.add_argument("--batch_size", type=str, default="auto", help="Batch size (e.g. '8' or 'auto')")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")

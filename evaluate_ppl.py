@@ -42,7 +42,7 @@ def parse_args():
     
     # Model Selection
     parser.add_argument("--model_type", type=str, default="holo", 
-                        choices=["holo", "gpt2", "mamba"], 
+                        choices=["holo", "gpt2", "mamba", "mamba2"], 
                         help="Type of model to evaluate")
     parser.add_argument("--model_path", type=str, default="./output/holo-small", 
                         help="Path to the directory containing the saved model and tokenizer")
