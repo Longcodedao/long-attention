@@ -26,5 +26,5 @@ holo_final_model/
 __pycache__/
 holo_final_model.zip
 
-cached_slimpajama_6b/
-step_10000.zip
+output/
+checkpoints/

@@ -90,16 +90,21 @@ def main():
     )
 
     # --- Load Data ---
-    test_loader = data_loader.get_dataloader(
-        console if accelerator.is_main_process else None, 
-        accelerator, 
-        tokenizer, 
-        args.dataset, 
-        args.batch_size, 
-        args.seq_len,
-        split=args.split,
-        num_workers=2 # slightly faster loading
-    )
+    if args.dataset == "slimpajama_6b":
+        test_loader = data_loader.get_dataloader(
+            console if accelerator.is_main_process else None, 
+            accelerator, 
+            tokenizer, 
+            args.dataset, 
+            args.batch_size, 
+            args.seq_len,
+            split=args.split,
+            num_workers=2 # slightly faster loading
+        
+    elif args.dataset == "pg19":
+        test_loader = data_loader.create_pg19_dataloader(
+            tokenizer, args.seq_len, args.batch_size, split=args.split
+        )
 
     # --- Prepare for Accelerator ---
     model, test_loader = accelerator.prepare(model, test_loader)

@@ -88,3 +88,55 @@ def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size,
         pin_memory=True
     )
 
+def create_pg19_dataloader(tokenizer, seq_len, batch_size, split="train"):
+    """
+    Streams PG19 books, tokenizes them, and packs them into contiguous chunks of seq_len.
+    This ensures no padding is used, maximizing efficient training.
+    """
+    # Load PG19 in streaming mode to avoid downloading 11GB+ immediately
+    dataset = datasets.load_dataset("pg19", split=split, streaming=True)
+
+    # Get the EOS Token ID 
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        # Fallback if tokenizer doesn't have an EOS defined (rare, but happens)
+        print("Warning: Tokenizer has no eos_token_id. Using 0.")
+        eos_token_id = 0
+        
+    def data_generator():
+        buffer = []
+        for sample in dataset:
+            text = sample['text']
+            # Skip short texts
+            if len(text) < 1000: continue
+            
+            tokens = tokenizer(text, add_special_tokens = False).input_ids
+            
+            buffer.extend(tokens)
+            buffer.append(eos_token_id)
+            
+            # Yield chunks of seq_len
+            while len(buffer) >= seq_len:
+                chunk = buffer[:seq_len]
+                buffer = buffer[seq_len:]
+                
+                # Convert to tensor
+                input_ids = torch.tensor(chunk, dtype=torch.long)
+                # Labels are same as input (causal LM)
+                yield {"input_ids": input_ids, "labels": input_ids}
+                
+    # Create iterable dataset
+    iterable_dataset = datasets.IterableDataset.from_generator(data_generator)
+    
+    # Simple collator
+    def collate_fn(examples):
+        return {
+            "input_ids": torch.stack([e["input_ids"] for e in examples]),
+            "labels": torch.stack([e["labels"] for e in examples])
+        }
+
+    return torch.utils.data.DataLoader(
+        iterable_dataset, 
+        batch_size=batch_size, 
+        collate_fn=collate_fn
+    )
