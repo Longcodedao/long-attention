@@ -1,25 +1,27 @@
 import torch 
 import torch.nn as nn
-from model.holo import HoloConfig, HoloForCausalLM
-from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 import torch.optim as optim
-from itertools import cycle
+from torch.utils.data import DataLoader, Dataset, random_split
 import argparse
-import sys
-import math
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import json
 
 # --- UI IMPORTS ---
 from rich.console import Console
 from rich.progress import (
-    Progress, 
-    SpinnerColumn, 
-    TextColumn, 
-    BarColumn, 
-    TimeRemainingColumn, 
+    Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn, MofNCompleteColumn
 )
 
-# --- LIBRARY HANDLING ---
+# --- MODEL IMPORTS ---
+# Ensure these are in your python path or adjust imports
+try:
+    from model.holo import HoloConfig, HoloForCausalLM
+except ImportError:
+    print("Warning: Holo model not found. Ensure 'model.holo' is available.")
+
 try:
     from mamba_ssm import MambaConfig, MambaForCausalLM
     MAMBA_LIB = "official"
@@ -29,214 +31,177 @@ except ImportError:
         MAMBA_LIB = "transformers"
     except ImportError:
         MAMBA_LIB = None
+        print("Warning: Mamba model not found.")
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="holo", choices=["holo", "mamba"])
-    parser.add_argument("--d_model", type=int, default=128) 
-    parser.add_argument("--n_layers", type=int, default=2)
-    parser.add_argument("--vocab_size", type=int, default=16) 
-    parser.add_argument("--steps", type=int, default=3000) 
-    return parser.parse_args()
-
-def calculate_accuracy(logits, labels):
-    """
-    Standard Causal LM accuracy calculation for the Induction task.
-    Matches the logit at index t with the label at index t+1.
-    """
-    # [batch, seq_len, vocab] -> [batch, seq_len]
-    preds = torch.argmax(logits, dim=-1)
-
-    # Shift: Predict the next token
-    shift_preds = preds[..., :-1].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-
-    # Mask only the 'value' token (-100 is ignored)
-    mask = shift_labels != -100
-    
-    if mask.sum() == 0: 
-        return 0.0
-        
-    correct = (shift_preds == shift_labels) & mask
-    return (correct.sum().float() / mask.sum().float()).item()
+# ==========================================
+# 1. DATASET & UTILITIES
+# ==========================================
 
 class InductionDataset(Dataset):
-    """
-    Exact Olsson et al. (2022) induction heads dataset.
-    """
-
-    def __init__(
-        self,
-        size: int = 10_000,
-        seq_len: int = 256,
-        vocab_size: int = 16,
-        prefix_length: int = 10
-    ):
-        self.size = size
-        self.seq_len = seq_len
-        self.vocab_size = vocab_size
+    def __init__(self, size=5500, seq_len=256, vocab_size=16, prefix_length=20):
+        self.size, self.seq_len, self.vocab_size = size, seq_len, vocab_size
         self.prefix_length = prefix_length
-        
-        assert prefix_length < seq_len - 2, "Need bigger prefix length"
+        self.special_token = vocab_size 
 
-    def __len__(self):
-        return self.size
+    def __len__(self): return self.size
 
     def __getitem__(self, idx):
-        # 1. Define the specific tokens
-        # Note: special_token is usually vocab_size (if embedding size allows)
+        # Same logic as before: Prefix... [Special] [Mem] ... Gap ... [Special] -> [Mem]
         all_tokens = torch.arange(self.vocab_size)
-        memory_token = torch.randint(0, self.vocab_size, (1, ))
-        special_token = self.vocab_size
-        token_important = torch.tensor([special_token, memory_token.item()])
-
-        # 2. Identify all tokens in vocab that ARE NOT the memory_token
-        # This creates a "safe" pool for the gap noise
+        memory_token = torch.randint(0, self.vocab_size, (1,)).item()
+        
+        prefix_len = torch.randint(1, self.prefix_length + 1, (1,)).item()
+        prefix = torch.randint(0, self.vocab_size, (prefix_len,))
+        
+        max_suffix = max(1, self.seq_len // 10)
+        suffix_len = torch.randint(1, max_suffix + 1, (1,)).item()
+        suffix = torch.randint(0, self.vocab_size, (suffix_len,))
+        
+        fixed_parts_len = prefix_len + 2 + 1 + suffix_len
+        gap_len = self.seq_len - fixed_parts_len
+        
         mask = all_tokens != memory_token
         other_tokens = all_tokens[mask]
-
-        # 3. Calculate gap length
-        # Format: prefix + [special, memory] + gap + [special] -> label: memory
-        gap_length = self.seq_len - self.prefix_length - 2 - 2
-
-        # 4. Randomly pick tokens from the "other_tokens" pool
-        # We pick random indices from 0 to len(other_tokens)
-        random_indices = torch.randint(0, len(other_tokens), (gap_length, ))
-        gap = other_tokens[random_indices]
-
-        # 5. Assemble the sequence
-        prefix_toks = torch.randint(0, self.vocab_size, (self.prefix_length, ))
-        # Concat: [prefix] + [special, memory] + [gap] + [special]
+        gap = other_tokens[torch.randint(0, len(other_tokens), (gap_len,))]
+        
         full_seq = torch.cat([
-            prefix_toks, 
-            token_important,
+            prefix, 
+            torch.tensor([self.special_token, memory_token]), 
             gap, 
-            torch.tensor([special_token]), # Trigger at index seq_len - 2
-            torch.tensor([0]) # Padding token at index seq_len - 1
+            torch.tensor([self.special_token]), 
+            suffix
         ])
         
-        labels = torch.full((self.seq_len, ), - 100)
-        labels[-1] = memory_token.item()
-        
+        labels = torch.full((self.seq_len,), -100)
+        trigger_pos = prefix_len + 2 + gap_len 
+        if trigger_pos + 1 < self.seq_len:
+            labels[trigger_pos + 1] = memory_token
+            
         return full_seq, labels
 
+def calculate_accuracy(logits, labels):
+    preds = torch.argmax(logits, dim=-1)
+    shift_preds = preds[..., :-1]
+    shift_labels = labels[..., 1:]
+    mask = shift_labels != -100
+    if mask.sum() == 0: return 0.0
+    return (shift_preds[mask] == shift_labels[mask]).float().mean().item()
 
-# --- MAIN ---
+# ==========================================
+# 2. MAIN EXECUTION
+# ==========================================
+
 if __name__ == "__main__":
-    args = get_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="holo", choices=["holo", "mamba"])
+    parser.add_argument("--epochs", type=int, default=20) 
+    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--vocab_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--train_len", type=int, default=256)
+    args = parser.parse_args()
+
     console = Console()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    TRAIN_SEQ_LEN = 256
-
-    # --- MODEL INIT ---
-    if args.model == "holo":
-        config = HoloConfig(
-            num_heads=4, 
-            d_model=args.d_model, 
-            num_hidden_layers=args.n_layers,
-            vocab_size=args.vocab_size + 1, 
-            holo_expansion_ratio=4
-        )
-        model = HoloForCausalLM(config).to(device)
     
-    elif args.model == "mamba":
-        if MAMBA_LIB is None:
-            console.print("[bold red]Error:[/bold red] Mamba libraries not found.")
-            sys.exit(1)
-        
-        # Initialize Mamba based on available library version
-        config_kwargs = {"vocab_size": args.vocab_size + 1}
+    # Ensure plots directory exists
+    os.makedirs("plots", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+
+    # --- INITIALIZE MODEL ---
+    if args.model == "holo":
+        config = HoloConfig(d_model=args.d_model, num_hidden_layers=args.n_layers, 
+                            vocab_size=args.vocab_size + 1, resid_dropout=0.0, dropout=0.0) # Low dropout for synthetic
+        model = HoloForCausalLM(config).to(device)
+    else:
+        config_kwargs = {"vocab_size": args.vocab_size + 1, "ssm_cfg": {"dropout": 0.0}}
         if MAMBA_LIB == "official":
-            config = MambaConfig(d_model=args.d_model, n_layer=args.n_layers, d_state=16, expand=2, **config_kwargs)
+            config = MambaConfig(d_model=args.d_model, n_layer=args.n_layers, **config_kwargs)
         else:
-            config = MambaConfig(hidden_size=args.d_model, num_hidden_layers=args.n_layers, state_size=16, expand=2, **config_kwargs)
+            config = MambaConfig(hidden_size=args.d_model, num_hidden_layers=args.n_layers, **config_kwargs)
         model = MambaForCausalLM(config).to(device)
 
-    # --- OPTIMIZER ---
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0, betas=(0.9, 0.95))
+    # --- TRAINING LOOP ---
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    # Train on Short Sequences (e.g., 256)
+    train_ds = InductionDataset(size=5000, seq_len=args.train_len, vocab_size=args.vocab_size)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+
+    with Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        BarColumn(), MofNCompleteColumn(),
+        TextColumn("[bold magenta]{task.fields[stats]}"), TimeRemainingColumn(),
+    ) as progress:
+        
+        train_task = progress.add_task(f"Training {args.model.upper()}", total=args.epochs, stats="Init")
+        
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            total_loss = 0
+            for x, y in train_loader:
+                x, y = x.to(device), y.to(device)
+                outputs = model(input_ids=x, labels=y)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                total_loss += loss.item()
+            
+            progress.update(train_task, advance=1, stats=f"Loss: {total_loss/len(train_loader):.4f}")
+
+    # --- FINAL EXTRAPOLATION BENCHMARK ---
+    console.print(f"\n[bold cyan]Running Final Extrapolation Benchmark for {args.model.upper()}...[/bold cyan]")
     
-    # Warmup + Cosine Decay
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=1e-3, total_steps=args.steps, 
-        pct_start=0.1, anneal_strategy='cos',
-        div_factor=10, final_div_factor=100
-    )
-
-    ds = InductionDataset(size=10000, seq_len=TRAIN_SEQ_LEN, vocab_size=args.vocab_size)
-    ds_loader = DataLoader(ds, batch_size=32, num_workers=0, pin_memory=True)
-    iterator = cycle(ds_loader)
-
-    model.train()
-
-    # --- PHASE 1: TRAINING ---
-    console.print(f"[bold]Training {args.model.upper()}...[/bold]")
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        TextColumn("[cyan]{task.completed}/{task.total}"),
-        BarColumn(),
-        TextColumn("[bold green]Induction Acc: {task.fields[acc]:.2%}"),
-        TimeRemainingColumn(),
-    )
-
-    with progress:
-        task_id = progress.add_task("Induction Task", total=args.steps, acc=0.0)
-
-        for step in range(1, args.steps + 1):
-            input_ids, labels = next(iterator)
-            input_ids, labels = input_ids.to(device), labels.to(device)
-
-            outputs = model(input_ids=input_ids, labels=labels)
-            loss = outputs.loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            progress.update(task_id, advance=1)
-
-            if step % 50 == 0:
-                acc = calculate_accuracy(outputs.logits, labels)
-                progress.update(task_id, acc=acc)
-                
-                if acc > 0.995 and step > 500:
-                    console.print(f"\n[bold green]Solved at step {step}![/bold green]")
-                    break
-
-    
-    console.print(f"\n[bold cyan]Extrapolation Benchmark ({args.model.upper()})[/bold cyan]")
-    test_lengths = [2**i for i in range(6, 21)] 
-    TEST_BATCH_SIZE = 1
-    NUM_EVAL_STEPS = 100 # Number of batches to average
+    # Powers of 2 from 64 up to 16384 (or higher if GPU permits)
+    test_lengths = [2**i for i in range(6, 21)] # 64, 128 ... 16384
+    accuracies = []
     
     model.eval()
     with torch.no_grad():
-        for length in test_lengths:
-            # Increase the dataset size to accommodate multiple batches
-            test_ds = InductionDataset(size=TEST_BATCH_SIZE * NUM_EVAL_STEPS, seq_len=length, vocab_size=args.vocab_size)
-            test_loader = DataLoader(test_ds, batch_size=TEST_BATCH_SIZE)
+        for l in test_lengths:
+            batch_accs = []
+            # Test 20 samples per length
+            for _ in range(100):
+                bench_ds = InductionDataset(size=1, seq_len=l, vocab_size=args.vocab_size)
+                bx, by = next(iter(DataLoader(bench_ds, batch_size=1)))
+                try:
+                    logits = model(input_ids=bx.to(device)).logits
+                    acc = calculate_accuracy(logits, by.to(device))
+                    batch_accs.append(acc)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        batch_accs.append(0.0) # Fail gracefully on OOM
+                        torch.cuda.empty_cache()
+                        break # Stop trying this length
+                    else:
+                        raise e
             
-            accuracies = []
-            
-            try:
-                for inputs, labels in test_loader:
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    outputs = model(input_ids=inputs)
-                    
-                    batch_acc = calculate_accuracy(outputs.logits, labels)
-                    accuracies.append(batch_acc)
-                
-                # Calculate mean accuracy for this length
-                mean_acc = sum(accuracies) / len(accuracies)
-                
-                color = "green" if mean_acc > 0.98 else "yellow" if mean_acc > 0.5 else "red"
-                console.print(f"Len {length:8d}: [{color}]{mean_acc*100:6.2f}% Avg Acc[/{color}] (over {NUM_EVAL_STEPS} batches)")
-            
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    console.print(f"Len {length:8d}: [bold red]OOM[/bold red]")
-                    torch.cuda.empty_cache()
-                    break
-                raise e
+            avg_acc = np.mean(batch_accs) if batch_accs else 0.0
+            accuracies.append(avg_acc)
+            console.print(f"Len {l}: {avg_acc:.2%}")
+
+    # --- PLOTTING (INDIVIDUAL) ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(test_lengths, accuracies, marker='o', linewidth=2, 
+             color='#2ecc71' if args.model=='mamba' else '#e74c3c', label=args.model.upper())
+    
+    plt.xscale('log', base=2)
+    plt.axvline(x=args.train_len, color='gray', linestyle='--', alpha=0.5, label=f"Train Len ({args.train_len})")
+    plt.ylim(-0.05, 1.05)
+    plt.xlabel("Sequence Length (Log2)")
+    plt.ylabel("Accuracy")
+    plt.title(f"{args.model.upper()} Induction Head Extrapolation")
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    
+    plot_path = f"plots/{args.model}_extrapolation.png"
+    plt.savefig(plot_path)
+    console.print(f"[bold green]Plot saved to {plot_path}[/bold green]")
+
+    # Save data for comparison script
+    os.makedirs("benchmarks/results", exist_ok = True)
+    
+    data_path = f"benchmarks/results/{args.model}_results.json"
+    with open(data_path, 'w') as f:
+        json.dump({"lengths": test_lengths, "accuracies": accuracies, "model": args.model}, f)

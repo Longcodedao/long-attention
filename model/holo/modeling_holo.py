@@ -29,7 +29,8 @@ class HoloModel(HoloPreTrainedModel):
     def __init__(self, config: HoloConfig):
         super().__init__(config)
         self.wte = nn.Embedding(config.vocab_size, config.d_model)
-        self.drop = nn.Dropout(0.0)
+        self.drop = nn.Dropout(config.dropout)
+        
         self.h = nn.ModuleList([HoloBlock(config) for _ in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
 

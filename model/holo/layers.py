@@ -131,28 +131,29 @@ class HoloMLP(nn.Module):
    def __init__(self, config): 
        super().__init__() 
        self.gate_proj = nn.Linear(
-           config.hidden_size, 
+           config.d_model, 
            config.intermediate_size, 
            bias=False
        ) 
        
        self.up_proj = nn.Linear(
-           config.hidden_size, 
+           config.d_model, 
            config.intermediate_size, 
            bias=False
        ) 
        
        self.down_proj = nn.Linear(
            config.intermediate_size, 
-           config.hidden_size, 
+           config.d_model, 
            bias=False
        ) 
        self.act_fn = nn.SiLU() 
- 
+       self.dropout = nn.Dropout(config.resid_dropout)
+       
    def forward(self, x): 
-       return self.down_proj(
-           self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-       )
+       x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+       x = self.down_proj(x)
+       return self.dropout(x)
         
 
 class HoloBlock(nn.Module):
@@ -178,14 +179,10 @@ class HoloBlock(nn.Module):
         self.gamma2 = nn.Parameter(torch.ones(config.d_model) * 0.1)
 
     def forward(self, x):
-        # Residual connection 1 (Mixer)
-        res = x
-        x = self.attn(self.ln1(x))
-        x = res + self.gamma1 * x
+        # Path 1: Attention + Residual Dropout (inside attn) + LayerScale
+        x = x + self.gamma1 * self.attn(self.ln1(x))
         
-        # Residual connection 2 (MLP)
-        res = x
-        x = self.mlp(self.ln2(x))
-        x = res + self.gamma2 * x
+        # Path 2: MLP + Residual Dropout (inside mlp) + LayerScale
+        x = x + self.gamma2 * self.mlp(self.ln2(x))
         
         return x

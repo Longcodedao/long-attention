@@ -17,12 +17,13 @@ class HoloConfig(PretrainedConfig):
         layer_norm_eps=1e-5,
         initializer_range=0.02,
         use_version = 2,     
-        dropout = 0.0,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
         phase_scale=3.0,
         tie_word_embeddings=False, # Whether to tie input/output embeddings
+        dropout = 0.0,
+        resid_dropout = 0.0,
         **kwargs,
     ):
         """
@@ -48,6 +49,7 @@ class HoloConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         
         self.dropout = dropout
+        self.resid_dropout = resid_dropout
         self.holo_expansion_ratio = holo_expansion_ratio
         self.phase_scale = phase_scale
 
