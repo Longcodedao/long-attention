@@ -126,6 +126,33 @@ class HoloAttentionV2(nn.Module):
 
         return self.dropout(output)
 
+
+class HoloMLP(nn.Module): 
+   def __init__(self, config): 
+       super().__init__() 
+       self.gate_proj = nn.Linear(
+           config.hidden_size, 
+           config.intermediate_size, 
+           bias=False
+       ) 
+       
+       self.up_proj = nn.Linear(
+           config.hidden_size, 
+           config.intermediate_size, 
+           bias=False
+       ) 
+       
+       self.down_proj = nn.Linear(
+           config.intermediate_size, 
+           config.hidden_size, 
+           bias=False
+       ) 
+       self.act_fn = nn.SiLU() 
+ 
+   def forward(self, x): 
+       return self.down_proj(
+           self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+       )
         
 
 class HoloBlock(nn.Module):
@@ -138,11 +165,13 @@ class HoloBlock(nn.Module):
         self.attn = HoloAttentionV2(config)
         self.ln2 = nn.LayerNorm(config.d_model)
         
-        self.mlp = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model * config.expansion_factor),
-            nn.GELU(),
-            nn.Linear(config.d_model * config.expansion_factor, config.d_model),     
-        )
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(config.d_model, config.d_model * config.expansion_factor),
+        #     nn.GELU(),
+        #     nn.Linear(config.d_model * config.expansion_factor, config.d_model),     
+        # )
+        self.mlp = HoloMLP(config)
+
         
         # LayerScale: Initialize to small value (0.1) to ease optimization
         self.gamma1 = nn.Parameter(torch.ones(config.d_model) * 0.1)

@@ -7,7 +7,7 @@ python -m benchmarks.induction_heads \
 
 python -m benchmarks.induction_heads \
         --model mamba \
-        --d_model 128 \
+        --d_model 64 \
         --n_layers 2 \
         --vocab_size 16 \
         --steps 5000

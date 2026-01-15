@@ -40,6 +40,8 @@ class HoloConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.expansion_factor = expansion_factor
         self.max_position_embeddings = max_position_embeddings
+
+        self.intermediate_size = self.d_model * expansion_factor
         
         self.layer_norm_eps = layer_norm_eps
         self.initializer_range = initializer_range

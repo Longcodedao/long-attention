@@ -97,7 +97,7 @@ class InductionDataset(Dataset):
 
         # 3. Calculate gap length
         # Format: prefix + [special, memory] + gap + [special] -> label: memory
-        gap_length = self.seq_len - self.prefix_length - 2 - 1
+        gap_length = self.seq_len - self.prefix_length - 2 - 2
 
         # 4. Randomly pick tokens from the "other_tokens" pool
         # We pick random indices from 0 to len(other_tokens)
@@ -111,13 +111,15 @@ class InductionDataset(Dataset):
             prefix_toks, 
             token_important,
             gap, 
-            torch.tensor([special_token])
+            torch.tensor([special_token]), # Trigger at index seq_len - 2
+            torch.tensor([0]) # Padding token at index seq_len - 1
         ])
         
         labels = torch.full((self.seq_len, ), - 100)
         labels[-1] = memory_token.item()
         
         return full_seq, labels
+
 
 # --- MAIN ---
 if __name__ == "__main__":
@@ -132,7 +134,7 @@ if __name__ == "__main__":
             num_heads=4, 
             d_model=args.d_model, 
             num_hidden_layers=args.n_layers,
-            vocab_size=args.vocab_size, 
+            vocab_size=args.vocab_size + 1, 
             holo_expansion_ratio=4
         )
         model = HoloForCausalLM(config).to(device)
@@ -143,7 +145,7 @@ if __name__ == "__main__":
             sys.exit(1)
         
         # Initialize Mamba based on available library version
-        config_kwargs = {"vocab_size": args.vocab_size}
+        config_kwargs = {"vocab_size": args.vocab_size + 1}
         if MAMBA_LIB == "official":
             config = MambaConfig(d_model=args.d_model, n_layer=args.n_layers, d_state=16, expand=2, **config_kwargs)
         else:
@@ -203,25 +205,34 @@ if __name__ == "__main__":
                     console.print(f"\n[bold green]Solved at step {step}![/bold green]")
                     break
 
-    # --- PHASE 2: EXTRAPOLATION ---
+    
     console.print(f"\n[bold cyan]Extrapolation Benchmark ({args.model.upper()})[/bold cyan]")
     test_lengths = [2**i for i in range(6, 21)] 
     TEST_BATCH_SIZE = 1
+    NUM_EVAL_STEPS = 100 # Number of batches to average
     
     model.eval()
     with torch.no_grad():
         for length in test_lengths:
-            test_ds = InductionDataset(size=TEST_BATCH_SIZE, seq_len=length, vocab_size=args.vocab_size)
+            # Increase the dataset size to accommodate multiple batches
+            test_ds = InductionDataset(size=TEST_BATCH_SIZE * NUM_EVAL_STEPS, seq_len=length, vocab_size=args.vocab_size)
             test_loader = DataLoader(test_ds, batch_size=TEST_BATCH_SIZE)
             
-            inputs, labels = next(iter(test_loader))
-            inputs, labels = inputs.to(device), labels.to(device)
+            accuracies = []
+            
             try:
-                outputs = model(input_ids=inputs)
-                acc = calculate_accuracy(outputs.logits, labels)
+                for inputs, labels in test_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(input_ids=inputs)
+                    
+                    batch_acc = calculate_accuracy(outputs.logits, labels)
+                    accuracies.append(batch_acc)
                 
-                color = "green" if acc > 0.98 else "yellow" if acc > 0.5 else "red"
-                console.print(f"Len {length:8d}: [{color}]{acc*100:6.2f}% Acc[/{color}]")
+                # Calculate mean accuracy for this length
+                mean_acc = sum(accuracies) / len(accuracies)
+                
+                color = "green" if mean_acc > 0.98 else "yellow" if mean_acc > 0.5 else "red"
+                console.print(f"Len {length:8d}: [{color}]{mean_acc*100:6.2f}% Avg Acc[/{color}] (over {NUM_EVAL_STEPS} batches)")
             
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
