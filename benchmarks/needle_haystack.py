@@ -16,11 +16,10 @@ from rich.progress import (
 )
 
 # --- MODEL IMPORTS ---
-# Ensure these are in your python path or adjust imports
 try:
     from model.holo import HoloConfig, HoloForCausalLM
 except ImportError:
-    print("Warning: Holo model not found. Ensure 'model.holo' is available.")
+    print("Warning: Holo model not found.")
 
 try:
     from mamba_ssm import MambaConfig, MambaForCausalLM
@@ -34,59 +33,74 @@ except ImportError:
         print("Warning: Mamba model not found.")
 
 # ==========================================
-# 1. DATASET & UTILITIES
+# 1. NEEDLE DATASET
 # ==========================================
 
-class InductionDataset(Dataset):
-    def __init__(self, size=5500, seq_len=256, vocab_size=16, prefix_length=20):
-        self.size, self.seq_len, self.vocab_size = size, seq_len, vocab_size
-        self.prefix_length = prefix_length
-        self.special_token = vocab_size 
-
+class NeedleHaystackDataset(Dataset):
+    def __init__(self, size=5000, context_len=256, vocab_size=16):
+        """
+        Synthethic Needle In A Haystack.
+        vocab_size: Number of 'noise' tokens.
+        Special Token (vocab_size): The 'Needle Key'.
+        """
+        self.size = size
+        self.context_len = context_len
+        self.vocab_size = vocab_size
+        self.needle_key_token = vocab_size  # The "Key" (e.g., "Passkey:")
+        
     def __len__(self): return self.size
 
     def __getitem__(self, idx):
-        # Same logic as before: Prefix... [Special] [Mem] ... Gap ... [Special] -> [Mem]
-        all_tokens = torch.arange(self.vocab_size)
-        memory_token = torch.randint(0, self.vocab_size, (1,)).item()
+        # 1. Generate the Target (The value we want to retrieve)
+        target_token = torch.randint(0, self.vocab_size, (1,)).item()
         
-        prefix_len = torch.randint(1, self.prefix_length + 1, (1,)).item()
-        prefix = torch.randint(0, self.vocab_size, (prefix_len,))
+        # 2. Prepare the Needle Sequence: [KEY] [VALUE]
+        # We assume the needle takes up 2 positions.
+        needle = torch.tensor([self.needle_key_token, target_token])
         
-        max_suffix = max(1, self.seq_len // 10)
-        suffix_len = torch.randint(1, max_suffix + 1, (1,)).item()
-        suffix = torch.randint(0, self.vocab_size, (suffix_len,))
+        # 3. Generate Haystack (Noise)
+        # Length = context - needle_len (2) - query_len (1)
+        haystack_len = self.context_len - 4
+        haystack = torch.randint(0, self.vocab_size, (haystack_len,))
         
-        fixed_parts_len = prefix_len + 2 + 1 + suffix_len
-        gap_len = self.seq_len - fixed_parts_len
+        # 4. Insert Needle at Random Depth
+        # Random insertion point between 0 and end of haystack
+        insert_idx = torch.randint(0, haystack_len + 1, (1,)).item()
         
-        mask = all_tokens != memory_token
-        other_tokens = all_tokens[mask]
-        gap = other_tokens[torch.randint(0, len(other_tokens), (gap_len,))]
+        context_part1 = haystack[:insert_idx]
+        context_part2 = haystack[insert_idx:]
         
+        # 5. Construct Full Sequence
+        # [Haystack_1] [Needle_Key] [Target] [Haystack_2] [Needle_Key] -> Predict [Target]
+        pad_token = 0
         full_seq = torch.cat([
-            prefix, 
-            torch.tensor([self.special_token, memory_token]), 
-            gap, 
-            torch.tensor([self.special_token]), 
-            suffix
+            context_part1,
+            needle,
+            context_part2,
+            torch.tensor([self.needle_key_token, pad_token]) # The Query
         ])
         
-        labels = torch.full((self.seq_len,), -100)
-        trigger_pos = prefix_len + 2 + gap_len 
-        if trigger_pos + 1 < self.seq_len:
-            labels[trigger_pos + 1] = memory_token
-            
+        # 6. Create Labels
+        labels = torch.full((self.context_len,), -100)
+        # The label is the LAST token (Target) which comes after the final Key
+        labels[-1] = target_token
+        
         return full_seq, labels
+        
 
 def calculate_accuracy(logits, labels):
-    preds = torch.argmax(logits, dim=-1)
-    shift_preds = preds[..., :-1]
-    shift_labels = labels[..., 1:]
-    mask = shift_labels != -100
-    if mask.sum() == 0: return 0.0
-    return (shift_preds[mask] == shift_labels[mask]).float().mean().item()
-
+    # We want the prediction coming FROM the 'Key' token.
+    # Since Input is [ ... Key, Target], the Key is at index -2.
+    
+    # Check prediction at position -2 (The Key)
+    key_logit = logits[..., -2, :] 
+    pred_token = torch.argmax(key_logit, dim=-1)
+    
+    # Check against the actual Target (which is at -1 in the input/labels)
+    target_token = labels[..., -1]
+    
+    return (pred_token == target_token).float().mean().item()
+    
 # ==========================================
 # 2. MAIN EXECUTION
 # ==========================================
@@ -106,18 +120,20 @@ if __name__ == "__main__":
     console = Console()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Ensure plots directory exists
     os.makedirs("plots", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
     # --- INITIALIZE MODEL ---
+    # Note: vocab_size + 1 for the regular tokens + 1 for the special Key token
+    model_vocab_size = args.vocab_size + 1 
+    
     if args.model == "holo":
         config = HoloConfig(d_model=args.d_model, num_hidden_layers=args.n_layers, 
-                            vocab_size=args.vocab_size + 1, resid_dropout=0.0, dropout=0.0,
-                           use_version = args.use_version) # Low dropout for synthetic
+                            vocab_size=model_vocab_size, resid_dropout=0.0, dropout=0.0,
+                            use_version=args.use_version)
         model = HoloForCausalLM(config).to(device)
     else:
-        config_kwargs = {"vocab_size": args.vocab_size + 1, "ssm_cfg": {"dropout": 0.0}}
+        config_kwargs = {"vocab_size": model_vocab_size, "ssm_cfg": {"dropout": 0.0}}
         if MAMBA_LIB == "official":
             config = MambaConfig(d_model=args.d_model, n_layer=args.n_layers, **config_kwargs)
         else:
@@ -126,8 +142,9 @@ if __name__ == "__main__":
 
     # --- TRAINING LOOP ---
     optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
-    # Train on Short Sequences (e.g., 256)
-    train_ds = InductionDataset(size=5000, seq_len=args.train_len, vocab_size=args.vocab_size)
+    
+    # Train on Short Contexts (Random Depths are inherent in the dataset class)
+    train_ds = NeedleHaystackDataset(size=5000, context_len=args.train_len, vocab_size=args.vocab_size)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
 
     with Progress(
@@ -136,7 +153,7 @@ if __name__ == "__main__":
         TextColumn("[bold magenta]{task.fields[stats]}"), TimeRemainingColumn(),
     ) as progress:
         
-        train_task = progress.add_task(f"Training {args.model.upper()}", total=args.epochs, stats="Init")
+        train_task = progress.add_task(f"Training NIAH ({args.model.upper()})", total=args.epochs, stats="Init")
         
         for epoch in range(1, args.epochs + 1):
             model.train()
@@ -152,20 +169,21 @@ if __name__ == "__main__":
             
             progress.update(train_task, advance=1, stats=f"Loss: {total_loss/len(train_loader):.4f}")
 
-    # --- FINAL EXTRAPOLATION BENCHMARK ---
-    console.print(f"\n[bold cyan]Running Final Extrapolation Benchmark for {args.model.upper()}...[/bold cyan]")
+    # --- FINAL EXTRAPOLATION BENCHMARK (NIAH SCALING) ---
+    console.print(f"\n[bold cyan]Running Needle-In-Haystack Scaling Benchmark...[/bold cyan]")
     
-    # Powers of 2 from 64 up to 16384 (or higher if GPU permits)
-    test_lengths = [2**i for i in range(6, 21)] # 64, 128 ... 16384
+    # Testing lengths: 256 up to 512K
+    test_lengths = [2**i for i in range(8, 20)] # Starts at 256
     accuracies = []
     
     model.eval()
     with torch.no_grad():
         for l in test_lengths:
             batch_accs = []
-            # Test 20 samples per length
-            for _ in range(100):
-                bench_ds = InductionDataset(size=1, seq_len=l, vocab_size=args.vocab_size)
+            # Test 50 samples per length (Random depths averaged)
+            for _ in range(50):
+                # Ensure batch size 1 to avoid padding issues with variable lengths if we were mixing
+                bench_ds = NeedleHaystackDataset(size=1, context_len=l, vocab_size=args.vocab_size)
                 bx, by = next(iter(DataLoader(bench_ds, batch_size=1)))
                 try:
                     logits = model(input_ids=bx.to(device)).logits
@@ -173,42 +191,39 @@ if __name__ == "__main__":
                     batch_accs.append(acc)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
-                        batch_accs.append(0.0) # Fail gracefully on OOM
+                        batch_accs.append(0.0) 
                         torch.cuda.empty_cache()
-                        break # Stop trying this length
+                        break 
                     else:
                         raise e
             
             avg_acc = np.mean(batch_accs) if batch_accs else 0.0
             accuracies.append(avg_acc)
-            console.print(f"Len {l}: {avg_acc:.2%}")
+            console.print(f"Ctx Len {l:5d}: {avg_acc:.2%}")
 
-    # --- PLOTTING (INDIVIDUAL) ---
+    # --- PLOTTING ---
     plt.figure(figsize=(10, 6))
     plt.plot(test_lengths, accuracies, marker='o', linewidth=2, 
-             color='#2ecc71' if args.model=='mamba' else '#e74c3c', label=args.model.upper())
+             color='#2ecc71' if args.model=='mamba' else '#3498db', label=args.model.upper())
     
     plt.xscale('log', base=2)
     plt.axvline(x=args.train_len, color='gray', linestyle='--', alpha=0.5, label=f"Train Len ({args.train_len})")
     plt.ylim(-0.05, 1.05)
-    plt.xlabel("Sequence Length (Log2)")
-    plt.ylabel("Accuracy")
-    plt.title(f"{args.model.upper()} Induction Head Extrapolation")
+    plt.xlabel("Haystack Length (Log2)")
+    plt.ylabel("Retrieval Accuracy")
+    plt.title(f"{args.model.upper()} Needle In A Haystack (PassKey)")
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.2)
-
     
     if args.model == "holo":
-        plot_path = f"plots/{args.model}_version{ model.config.use_version}_extrapolation.png"
+        plot_path = f"plots/{args.model}_v{args.use_version}_niah.png"
     else:
-        plot_path = f"plots/{args.model}_extrapolation.png"
+        plot_path = f"plots/{args.model}_niah.png"
         
     plt.savefig(plot_path)
     console.print(f"[bold green]Plot saved to {plot_path}[/bold green]")
 
-    # Save data for comparison script
-    os.makedirs("benchmarks/results", exist_ok = True)
-    
-    data_path = f"benchmarks/results/{args.model}_results.json"
+    # Save Results
+    data_path = f"results/{args.model}_niah_results.json"
     with open(data_path, 'w') as f:
         json.dump({"lengths": test_lengths, "accuracies": accuracies, "model": args.model}, f)
