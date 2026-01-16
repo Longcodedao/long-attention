@@ -227,3 +227,24 @@ if __name__ == "__main__":
     data_path = f"results/{args.model}_niah_results.json"
     with open(data_path, 'w') as f:
         json.dump({"lengths": test_lengths, "accuracies": accuracies, "model": args.model}, f)
+    ''' Comments on this code (Long Dang - 16/01/2026
+    It has professional structure, good error handling (OOM catching), and clean UI (rich).
+    However, scientifically, it has three fatal flaws that will cause the test to fail or produce misleading results, exactly as I discovered in smaller scale experiments.
+    Critical Analysis
+    1. The "Position Overfitting" Trap (Fatal)
+    The Code: train_ds = NeedleHaystackDataset(..., context_len=args.train_len)
+    The Problem: You train on a fixed length (e.g., 256).
+    The Physics: Neural networks are lazy. If every training example is length 256, the model learns: "The answer is always at position ~255."    
+    The Result: When you evaluate on length 512, the model looks at position 255, sees random noise, and fails.
+    The Fix: You must use Curriculum Training. The training batch should contain a mix of lengths (e.g., random between 32 and 256) so the model learns the mechanism ("Find the Key") rather than the location.
+    2. The "Collision" Problem (Fatal)
+    The Code: vocab_size=16
+    The Problem: With only 16 possible tokens, the "Needle Key" (Token #16) will appear randomly inside the Haystack many times purely by chance.
+    The Result: The model sees: [Key] [Target] ... [Key] [Random] ... [Key] [Random] ... Query: [Key]. It doesn't know which Key is the needle. It's a "Many-to-One" ambiguity.
+    The Fix: Set vocab_size=1000 or higher to ensure the Needle Key is statistically unique.
+    3. The "Identity" Architecture Gap
+    The Code: from model.holo import HoloForCausalLM
+    The Problem: It is an old code
+    The Reality: The standard/old Holo architecture (likely just Rotors) cannot solve NIAH because Rotors rotate the needle out of phase over long distances.
+    The Fix: You must ensure HoloForCausalLM uses the Static Head (freq=0) and Shared Q/K architecture --> change the name and use the new library
+    '''
