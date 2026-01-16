@@ -242,9 +242,14 @@ if __name__ == "__main__":
     The Problem: With only 16 possible tokens, the "Needle Key" (Token #16) will appear randomly inside the Haystack many times purely by chance.
     The Result: The model sees: [Key] [Target] ... [Key] [Random] ... [Key] [Random] ... Query: [Key]. It doesn't know which Key is the needle. It's a "Many-to-One" ambiguity.
     The Fix: Set vocab_size=1000 or higher to ensure the Needle Key is statistically unique.
+    
+    
     3. The "Identity" Architecture Gap
     The Code: from model.holo import HoloForCausalLM
     The Problem: It is an old code
     The Reality: The standard/old Holo architecture (likely just Rotors) cannot solve NIAH because Rotors rotate the needle out of phase over long distances.
     The Fix: You must ensure HoloForCausalLM uses the Static Head (freq=0) and Shared Q/K architecture --> change the name and use the new library
+
+    Rebuttal: (I have changed to the newest version of LongAttention by using 
+    args.use_version == 2)
     '''
