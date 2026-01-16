@@ -212,3 +212,20 @@ if __name__ == "__main__":
     data_path = f"benchmarks/results/{args.model}_results.json"
     with open(data_path, 'w') as f:
         json.dump({"lengths": test_lengths, "accuracies": accuracies, "model": args.model}, f)
+
+''' Comments by Long Dang 16/01/2026
+The code provided is a decent start for a general model test, but it has several critical flaws that will likely lead to the same "0% Accuracy" or "Overfitting" failures.
+Critical Analysis
+1/ Architecture Mismatch (The Fatal Flaw):
+The Code: It imports from model.holo import HoloForCausalLM.
+The Problem: This uses to an older version of our model. The "Memory Wall" is only broken by the specific "Holy Grail" architecture we just derived (Conv1d + Static Head + Shared QK). If you run this script with a standard Holo model, it will fail the long-context test.
+The Fix: You must inject the updated LongAttention class (the one with the conv1d and freqs[0]=0 logic) directly into this script or update your library.
+2/ Fixed-Length Training (The "Cliff"):
+The Code: train_ds = InductionDataset(..., seq_len=args.train_len) (defaults to 256).
+The Problem: As we proved, models trained on fixed lengths overfit to positional embeddings. A model trained on 256 tokens will fail completely at 257 tokens because it has never seen those position indices.
+The Fix: You need Curriculum Training. The training loop must feed batches of variable lengths (e.g., random between 32 and 256) to force the model to learn the mechanism (Induction) rather than the location.
+3/ Vocabulary Size vs. Sequence Length:
+The Code: vocab_size=16, test_lengths up to 16,384.
+The Problem: With a vocab of 16 and a sequence of 16,000, the "Needle" (Memory Token) will statistically appear ~1,000 times in the noise gap purely by chance. This makes the task ambiguous ("Which 'A' should I recall?").
+The Fix: Increase vocab_size significantly (e.g., to 100 or 1000) so the Needle is unique or rare, ensuring a clean signal.
+'''
