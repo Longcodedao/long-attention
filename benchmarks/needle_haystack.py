@@ -227,29 +227,24 @@ if __name__ == "__main__":
     data_path = f"results/{args.model}_niah_results.json"
     with open(data_path, 'w') as f:
         json.dump({"lengths": test_lengths, "accuracies": accuracies, "model": args.model}, f)
-    ''' Comments on this code (Long Dang - 16/01/2026
-    It has professional structure, good error handling (OOM catching), and clean UI (rich).
-    However, scientifically, it has three fatal flaws that will cause the test to fail or produce misleading results, exactly as I discovered in smaller scale experiments.
-    Critical Analysis
-    1. The "Position Overfitting" Trap (Fatal)
-    The Code: train_ds = NeedleHaystackDataset(..., context_len=args.train_len)
-    The Problem: You train on a fixed length (e.g., 256).
-    The Physics: Neural networks are lazy. If every training example is length 256, the model learns: "The answer is always at position ~255."    
-    The Result: When you evaluate on length 512, the model looks at position 255, sees random noise, and fails.
-    The Fix: You must use Curriculum Training. The training batch should contain a mix of lengths (e.g., random between 32 and 256) so the model learns the mechanism ("Find the Key") rather than the location.
-    2. The "Collision" Problem (Fatal)
-    The Code: vocab_size=16
-    The Problem: With only 16 possible tokens, the "Needle Key" (Token #16) will appear randomly inside the Haystack many times purely by chance.
-    The Result: The model sees: [Key] [Target] ... [Key] [Random] ... [Key] [Random] ... Query: [Key]. It doesn't know which Key is the needle. It's a "Many-to-One" ambiguity.
-    The Fix: Set vocab_size=1000 or higher to ensure the Needle Key is statistically unique.
-    
-    
-    3. The "Identity" Architecture Gap
-    The Code: from model.holo import HoloForCausalLM
-    The Problem: It is an old code
-    The Reality: The standard/old Holo architecture (likely just Rotors) cannot solve NIAH because Rotors rotate the needle out of phase over long distances.
-    The Fix: You must ensure HoloForCausalLM uses the Static Head (freq=0) and Shared Q/K architecture --> change the name and use the new library
-
-    Rebuttal: (I have changed to the newest version of LongAttention by using 
-    args.use_version == 2)
+   
+''' Ver. 2: Comments on the new code (Long Dang - 16/01/2026
+    There are 3 Critical Errors that will cause our model to fail silently (Loss decreases, Accuracy 0%).
+    1. The "Token Collision" Bug (Fatal)
+    The Code: haystack = torch.randint(0, self.vocab_size...) and pad_token = 0.
+    The Problem: The token 0 is used for random noise inside the haystack, but it is also used as the query delimiter ([Needle Key] [Pad]).
+    Result: The model cannot tell if 0 is just garbage noise or the signal to output the answer. It gets confused and guesses.
+    Fix: Reserve a special ID (e.g., vocab_size - 1) only for prompts/padding and exclude it from noise generation.
+    2. The "Wrong Logit" Bug (Evaluation)
+    The Code: key_logit = logits[..., -2, :]
+    The Problem: The student's input sequence is [... Needle_Key, Pad].
+    The model predicts the next token.
+    The logit at index -2 (Needle Key) predicts the token at -1 (Pad).
+    The logit at index -1 (Pad) predicts the Target.
+    Result: you checked if the model predicts the Pad token correctly, not the Answer.
+    Fix: Check logits[..., -1, :] (the last token).
+    3. Lack of Associative Symmetry
+    The Code: [Needle Key] [Target] ... [Haystack] ... [Needle Key] -> [Target]
+    The Problem: This is "Hard Mode". The model has to recall Target seeing Key.
+    The Fix: "Easy Mode" (Mechanism Learning) requires [Prompt] [Key] ... [Prompt] [Key]. The model learns to bind Key to Prompt.
     '''
