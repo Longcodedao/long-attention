@@ -5,18 +5,17 @@ class LongConfig(PretrainedConfig):
 
     def __init__(
         self,
-        vocab_size = 50304,
-        hidden_size = 768,
-        num_hidden_layers = 12,
-        num_heads = 12,
-        intermediate_size = 3072,
-        layer_norm_eps = 1e-5,
-        max_position_embeddings = 2048, 
-        conv_kernel = 4,           # Local context window
-        gate_bias_init = 1.0,      # Innovation: "Born Open" (+1.0)
-        gate_act = "relu",         # Innovation: Hard Gating
-        hybrid_ratio=4,          # 1 Standard Attn every 4 layers
-        rope_theta=10000.0,
+        vocab_size=50304,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_heads=12,
+        expansion_ratio=4, 
+        layer_norm_eps=1e-5,
+        max_position_embeddings=2048, 
+        conv_kernel=4,
+        hybrid_ratio=0, # Set > 0 (e.g., 4) to enable Anchor Layers
+        initializer_range=0.02,
+        tie_word_embeddings=True,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -24,12 +23,18 @@ class LongConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_heads = num_heads
-        self.intermediate_size = intermediate_size
+        self.intermediate_size = hidden_size * expansion_ratio
         self.layer_norm_eps = layer_norm_eps
         self.max_position_embeddings = max_position_embeddings
-        
         self.conv_kernel = conv_kernel
-        self.gate_bias_init = gate_bias_init
-        self.gate_act = gate_act
         self.hybrid_ratio = hybrid_ratio
-        self.rope_theta = rope_theta
+        self.initializer_range = initializer_range
+        self.tie_word_embeddings = tie_word_embeddings
+
+def get_187m_config():
+    return LongConfig(
+        vocab_size=50304,
+        hidden_size=768,
+        num_hidden_layers=18, # <--- The key change
+        num_heads=12
+    )

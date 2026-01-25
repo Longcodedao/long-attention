@@ -2,89 +2,111 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from datasets import load_dataset, IterableDataset
-from datasets import load_from_disk
-
+from datasets import load_dataset, IterableDataset, load_from_disk
 
 def load_data_source(name, split):
     """Helper to load various datasets."""
-    # 1. The Small 6B Version -> DOWNLOAD IT (streaming=False)
-    # This allows global shuffling and faster training after the initial download.
+    # 1. SlimPajama 6B
     if name == "slimpajama_6b":
         return load_dataset("DKYoon/SlimPajama-6B", split=split, streaming=True)
     
-    # 2. The Full 627B Version (Massive - requires streaming)
+    # 2. SlimPajama 627B
     elif name == "slimpajama_627b":
         return load_dataset("cerebras/SlimPajama-627B", split=split, streaming=True)
         
-    # 3. Local Custom Files (JSONL/TXT)
+    # 3. Local Custom Files
     elif os.path.exists(name):
-        # Local files are usually small enough to not stream
-        return load_dataset("json", data_files=name, split=split, streaming=False)
+        return load_dataset("json", data_files=name, split=split, streaming=True) # Force streaming for packing
         
     else:
         raise ValueError(f"Unknown dataset or path: {name}")
-        
+
 
 def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size, 
-                   seq_len=2048, split="train", num_workers=4, prefetch_factor=2):
+                   seq_len=2048, split="train", num_workers=0, prefetch_factor=None):
     
     if accelerator.is_main_process:
-        console.print(f"[Dataset] Loading '{dataset_name}' (Split: {split})...")
+        console.print(f"[Dataset] Loading '{dataset_name}' (Split: {split}) with PACKING...")
 
+    # 1. Load the raw streaming dataset
     raw_dataset = load_data_source(dataset_name, split)
 
-
-    # 1. SHUFFLE (Training Only)
-    # Essential for streaming datasets to break correlation
+    # 2. Shuffle (Buffer Shuffling) - Only for training
     if split == "train":
-        # Buffer size depends on RAM. 10,000 is a safe starting point.
+        # Buffer size of 10k is a good balance for RAM vs Randomness
         raw_dataset = raw_dataset.shuffle(seed=42, buffer_size=10_000)
 
-    # 2. SHARDING (Training Only)
-    if isinstance(raw_dataset, IterableDataset) and accelerator.num_processes > 1:
-        if split == "train":
-            raw_dataset = raw_dataset.shard(
-                num_shards=accelerator.num_processes,
-                index=accelerator.process_index
-            )
-    
-    # 3. DYNAMIC COLUMN DETECTION
-    # Peek at the first item to know exactly what columns to remove
-    try:
-        sample = next(iter(raw_dataset))
-        # Detect text column if not standard
-        text_column = "text" if "text" in sample else list(sample.keys())[0]
-        # remove ALL columns that existed in the raw data
-        remove_cols = list(sample.keys()) 
-    except StopIteration:
-        # Handle empty dataset edge case
-        text_column = "text"
-        remove_cols = ["text", "meta", "red_pajama_subset"]
-
-    # 4. TOKENIZATION
-    def tokenization_fn(examples):
-        return tokenizer(
-            examples[text_column],
-            truncation=True,
-            max_length=seq_len,
-            padding="max_length",
+    # 3. Handle Sharding for Multi-GPU (Accelerate)
+    # Even with streaming, we need to ensure each GPU gets different data
+    if accelerator.num_processes > 1:
+        # HuggingFace IterableDataset supports sharding at the file/stream level
+        raw_dataset = raw_dataset.shard(
+            num_shards=accelerator.num_processes,
+            index=accelerator.process_index
         )
 
-    # 5. BATCHED MAPPING (Critical for Speed)
-    mapped_ds = raw_dataset.map(
-        tokenization_fn, 
-        batched=True,           # <--- ENABLES FAST RUST TOKENIZATION
-        batch_size=1000,        # Process 1k texts at a time
-        remove_columns=remove_cols
-    )
-    mapped_ds = mapped_ds.with_format("torch")
+    # 4. Define the Packing Generator
+    # This replaces the .map() function. It tokenizes and concatenates streams.
+    def packed_generator():
+        # Get EOS token (Critical for separating documents)
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            eos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+            if eos_id is None: eos_id = 0 # Final fallback
+        
+        buffer = []
+        
+        # Determine text column name dynamically
+        iterator = iter(raw_dataset)
+        try:
+            first_item = next(iterator)
+            text_col = "text" if "text" in first_item else list(first_item.keys())[0]
+            
+            # Put the first item back (conceptually) or process it
+            # Since we can't put back in iterator, we process it first
+            item_list = [first_item]
+        except StopIteration:
+            return
 
+        # Chain the first item with the rest of the iterator
+        import itertools
+        full_iterator = itertools.chain(item_list, iterator)
+
+        for sample in full_iterator:
+            text = sample[text_col]
+            
+            # Basic filtering for empty lines
+            if not text or len(text) < 10: 
+                continue
+
+            # Tokenize FAST (No padding, no truncation yet)
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            
+            # Add to buffer with EOS separator
+            buffer.extend(tokens)
+            buffer.append(eos_id)
+
+            # Yield full chunks
+            while len(buffer) >= seq_len:
+                chunk = buffer[:seq_len]
+                buffer = buffer[seq_len:] # Keep remainder
+                
+                # Yield tensor
+                yield {
+                    "input_ids": torch.tensor(chunk, dtype=torch.long),
+                    "labels": torch.tensor(chunk, dtype=torch.long)
+                }
+
+    # 5. Create the Iterable Dataset
+    packed_dataset = IterableDataset.from_generator(packed_generator)
+
+    # 6. Create DataLoader
+    # Note: num_workers must be 0 for simple IterableDatasets usually, 
+    # unless using specific torchdata pipes, to avoid duplication issues.
     return DataLoader(
-        mapped_ds,
+        packed_dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
+        num_workers=0, # Keep 0 for safety with generators
         pin_memory=True
     )
 

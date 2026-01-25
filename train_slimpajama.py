@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore", message=".*barrier().*")
 # 1. Argument Parsing
 # ===============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Holo Training Script")
+    parser = argparse.ArgumentParser(description="LLM Training Script")
 
     # Dataset 
     parser.add_argument("--dataset", type=str, default="slimpajama_6b", 
@@ -40,30 +40,31 @@ def parse_args():
     parser.add_argument("--val_dataset", type=str, default="slimpajama_6b", help="Dataset to use for validation")
 
     # Model Configuration 
-    parser.add_argument("--model_type", type=str, default="holo", 
-                        choices=["holo", "gpt2", "mamba", "mamba2"], 
+    parser.add_argument("--model_type", type=str, default="long", 
+                        choices=["holo", "gpt2", "mamba", "mamba2", "long"], # <--- Added 'long' here
                         help="Type of model to train")
-    parser.add_argument("--model_size", type=str, default="small", help="Model size preset (e.g. small, medium)")
+    parser.add_argument("--model_size", type=str, default="187m", 
+                        help="Model size preset (e.g. small, medium, 187m)")
     
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=2, help="Per-device batch size")
-    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
+    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--max_steps", type=int, default=1000, help="Total training steps")
+    parser.add_argument("--max_steps", type=int, default=5000, help="Total training steps")
     parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length (context window)")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for scheduler")
-    parser.add_argument("--save_steps", type=int, default=200, help="Steps interval for saving checkpoints")
-    parser.add_argument("--eval_steps", type=int, default=10, help="Run evaluation every X steps")
+    parser.add_argument("--save_steps", type=int, default=500, help="Steps interval for saving checkpoints")
+    parser.add_argument("--eval_steps", type=int, default=50, help="Run evaluation every X steps")
 
     # Optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")    
 
     # Checkpointing
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './holo_checkpoints/step_500')")
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/holo_small", help="Directory to save checkpoints")
-    parser.add_argument("--output_dir", type=str, default="./output/holo_small", help="Directory to save the final model")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './checkpoints/step_500')")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/long_187m", help="Directory to save checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./output/long_187m", help="Directory to save the final model")
     
-    parser.add_argument("--log_dir", type=str, default="./holo_logs", help="Directory for TensorBoard logs")
+    parser.add_argument("--log_dir", type=str, default="./logs", help="Directory for TensorBoard logs")
     
     return parser.parse_args()
 
@@ -74,7 +75,7 @@ args = parse_args()
 # ===============================
 accelerator = Accelerator(
     gradient_accumulation_steps=args.grad_accum_steps,
-    # mixed_precision=args.mixed_precision,
+    # mixed_precision="bf16", # Uncomment if you want to hardcode, otherwise set via 'accelerate config'
     log_with="tensorboard",
     project_dir="."
 )
@@ -87,7 +88,7 @@ if args.model_type == "mamba" and accelerator.mixed_precision == "no":
 
 if accelerator.is_main_process:
     utils.print_config_table(console, accelerator, args)
-    console.print(f"[bold green]Starting Training...[/bold green]")
+    console.print(f"[bold green]Starting Training for {args.model_type.upper()} ({args.model_size})...[/bold green]")
 
 
 # ===============================
@@ -120,6 +121,9 @@ val_loader = data_loader.get_dataloader(
     args.val_dataset, args.batch_size, args.seq_len, split="validation"
 )
 
+# ===============================
+# 5. Optimizer & Scheduler
+# ===============================
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
 scheduler = get_cosine_schedule_with_warmup(
     optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
@@ -134,7 +138,7 @@ model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
 loss_metric = MeanMetric().to(accelerator.device)
 
 # ===============================
-# 4. Resume Logic
+# 6. Resume Logic
 # ===============================
 global_step = 0
 resume_step = 0
@@ -190,7 +194,7 @@ accelerator.wait_for_everyone()
 
 
 # ===============================
-# 5. The Evaluation Function
+# 7. The Evaluation Function
 # ===============================
 def evaluate(model, val_loader, max_eval_batches=50):
     """
@@ -218,7 +222,7 @@ def evaluate(model, val_loader, max_eval_batches=50):
     return sum(losses) / len(losses) if losses else float("inf")
 
 # ===============================
-# 6. Training Loop
+# 8. Training Loop
 # ===============================
 model.train()
 data_iter = iter(train_loader)
@@ -264,6 +268,7 @@ try:
             batch = next(data_iter)
 
         with accelerator.accumulate(model):
+            
             outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
             loss = outputs.loss
             accelerator.backward(loss)
@@ -357,7 +362,7 @@ try:
             if global_step % args.save_steps == 0:
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
-                    system_message = f"[bold yellow]Saving checkpoint to step_{global_step}...[/bold yellow]"                    
+                    system_message = f"[bold yellow]Saving checkpoint to step_{global_step}...[/bold yellow]"                     
                     live.update(Group(metrics_panel, val_panel, Panel(system_message, border_style="yellow"), progress_bar))
                     
                 accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
