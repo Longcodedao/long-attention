@@ -25,7 +25,8 @@ class LongHFModel(PreTrainedModel):
                     nn.GELU(),
                     nn.Linear(4 * config.hidden_size, config.hidden_size)
                 ),
-                "ln": nn.LayerNorm(config.hidden_size)
+                "ln_1": nn.LayerNorm(config.hidden_size),
+                "ln_2": nn.LayerNorm(config.hidden_size)
             })
             for i in range(config.num_hidden_layers)
         ])
@@ -38,6 +39,8 @@ class LongHFModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
+
+
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
@@ -46,6 +49,9 @@ class LongHFModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
 
     def forward(
         self,
@@ -62,28 +68,20 @@ class LongHFModel(PreTrainedModel):
         
         x = self.wte(input_ids)
         next_states = []
-        state_idx = 0
         
-        for i, layer_block in enumerate(self.layers):
-            attn_layer = layer_block["attention"]
-            mlp = layer_block["mlp"]
-            ln = layer_block["ln"]
-
-            # Handle state (past_key_values) for recurrent layers
-            layer_state = None
-            if past_key_values is not None and isinstance(attn_layer, LongAttention):
-                layer_state = past_key_values[state_idx]
-
-            # Forward pass through Attention
-            h, next_s = attn_layer(x, state=layer_state)
+        for i, layer in enumerate(self.layers):
+            # 1. Pre-LN Attention Path
+            residual = x
+            # Use layer["ln_1"] BEFORE attention
+            h, next_s = layer["attention"](layer["ln_1"](x), state=None if past_key_values is None else past_key_values[i])
+            x = residual + h
             
-            # Residual + MLP
-            x = x + h
-            x = x + mlp(ln(x))
+            # 2. Pre-LN MLP Path
+            residual = x
+            # Use layer["ln_2"] BEFORE MLP
+            x = residual + layer["mlp"](layer["ln_2"](x))
             
-            if isinstance(attn_layer, LongAttention):
-                next_states.append(next_s)
-                state_idx += 1
+            next_states.append(next_s)
         
         x = self.ln_f(x)
         logits = self.lm_head(x)
