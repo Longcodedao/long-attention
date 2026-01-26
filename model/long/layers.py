@@ -278,6 +278,75 @@ class LongMLP(nn.Module):
 #         return self.fc2(self.act(self.fc1(x)))
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, x, seq_len):
+        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb[None, :, None, :] # [1, T, 1, D]
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+
+class RoPESelfAttention(nn.Module):
+    """Standard Attention with Rotary Positional Embeddings"""
+    def __init__(self, config: LongConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        
+        self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.ln = nn.LayerNorm(self.hidden_size)
+
+    def forward(self, x, state=None):
+        B, T, C = x.shape
+        
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
+
+        # Apply RoPE
+        emb = self.rotary_emb(q, T)
+        cos, sin = emb.cos(), emb.sin()
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Scaled Dot-Product Attention
+        # PyTorch 2.0+ efficient attention
+        q = q.transpose(1, 2) # [B, H, T, D]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, 
+            is_causal=True
+        )
+        
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
+        return self.ln(self.o_proj(attn_out)), None
+
+    def reset_parameters(self):
+        """Called by HF _init_weights to ensure custom init"""
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.o_proj.weight)
+
 
 class LongBlock(nn.Module):
     """

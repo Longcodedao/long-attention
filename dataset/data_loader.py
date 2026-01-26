@@ -1,9 +1,8 @@
 import os
 import torch
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
-from datasets import load_dataset, IterableDataset, load_from_disk
 import itertools
+from torch.utils.data import DataLoader, IterableDataset as TorchIterableDataset
+from datasets import load_dataset, IterableDataset as HFIterableDataset
 
 def load_data_source(name, split):
     """Helper to load various datasets."""
@@ -19,17 +18,17 @@ def load_data_source(name, split):
     elif name == "wikitext":
         return load_dataset("wikitext", "wikitext-103-v1", split=split, streaming=True)
     
-    # 4, PG19 (Project Gutenberg)
+    # 4. PG19 (Project Gutenberg)
     elif name == "pg19":
-        return load_dataet("google-deepmind/pg19", split = split, streaming = True)
-                           
-    # 3. Local Custom Files
+        return load_dataset("emozilla/pg19", split=split, streaming=True)
+                            
+    # 5. Local Custom Files
     elif os.path.exists(name):
-        return load_dataset("json", data_files=name, split=split, streaming=True) # Force streaming for packing
+        # Force streaming so we can use the same logic for local JSON/Text files
+        return load_dataset("json", data_files=name, split=split, streaming=True)
         
     else:
         raise ValueError(f"Unknown dataset or path: {name}")
-
 
 def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size, 
                    seq_len=2048, split="train", num_workers=0):
@@ -40,23 +39,32 @@ def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size,
     # 1. Load the raw streaming dataset
     raw_dataset = load_data_source(dataset_name, split)
 
-    # 2. Shuffle (Buffer Shuffling) - Only for training
+    # 2. Efficient Sharding Logic
+    # We attempt to use HF's efficient .shard(). If the dataset has fewer files 
+    # than GPUs (rare for big datasets), we fall back to manual skipping.
+    is_sharded = False
+    try:
+        if accelerator.num_processes > 1:
+            # This assigns specific files to specific GPUs (Zero redundancy)
+            raw_dataset = raw_dataset.shard(
+                num_shards=accelerator.num_processes,
+                index=accelerator.process_index
+            )
+            is_sharded = True
+    except Exception as e:
+        # This usually happens if the dataset doesn't support file-level sharding
+        if accelerator.is_main_process:
+            console.print(f"[Warning] Could not shard at file level: {e}. Using manual skipping fallback.")
+        is_sharded = False
+
+    # 3. Buffer Shuffling (Only for training)
     if split == "train":
-        # Buffer size of 10k balances RAM usage vs Randomness
+        # Buffer size balances randomness vs RAM usage. 10k is usually safe.
         raw_dataset = raw_dataset.shuffle(seed=42, buffer_size=10_000)
 
-    # 3. Handle Sharding for Multi-GPU (Accelerate)
-    # If the number of files is less than GPUs, It will cause error (Disable)
-    # if accelerator.num_processes > 1:
-    #     raw_dataset = raw_dataset.shard(
-    #         num_shards=accelerator.num_processes,
-    #         index=accelerator.process_index
-    #     )
-
     # 4. Define the Packing Generator
-    # 3. Define the Packing Generator with Manual Sharding
     def packed_generator():
-        # Get EOS token
+        # Auto-detect EOS token, fallback to 0 if missing
         eos_id = tokenizer.eos_token_id
         if eos_id is None:
             if hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
@@ -66,50 +74,61 @@ def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size,
         
         buffer = []
         
-        # Iterator setup
-        iterator = iter(raw_dataset)
-        try:
-            first_item = next(iterator)
-            text_col = "text" if "text" in first_item else list(first_item.keys())[0]
-            full_iterator = itertools.chain([first_item], iterator)
-        except StopIteration:
-            return
+        # --- INFINITE LOOP FOR TRAINING ---
+        # We loop forever if split="train". This prevents deadlocks where one GPU 
+        # finishes 1 batch earlier than others and waits forever.
+        while True:
+            iterator = iter(raw_dataset)
 
-        # ### FIX: MANUAL INTERLEAVING ###
-        # We manually skip samples that don't belong to this GPU.
-        # This works for ANY dataset, even if it's just 1 file.
-        process_rank = accelerator.process_index
-        num_processes = accelerator.num_processes
+            # Manual skipping fallback (only if .shard() failed above)
+            if not is_sharded and accelerator.num_processes > 1:
+                # This is less efficient but guarantees correctness
+                iterator = itertools.islice(iterator, 
+                                            accelerator.process_index,
+                                            None, 
+                                            accelerator.num_processes)
 
-        for i, sample in enumerate(full_iterator):
-            # If we have 2 GPUs:
-            # GPU 0 processes indices: 0, 2, 4...
-            # GPU 1 processes indices: 1, 3, 5...
-            if i % num_processes != process_rank:
-                continue
-
-            text = sample[text_col]
-            
-            if not text or len(text.strip()) < 2: 
-                continue
-
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            
-            buffer.extend(tokens)
-            buffer.append(eos_id)
-
-            while len(buffer) >= seq_len:
-                chunk = buffer[:seq_len]
-                buffer = buffer[seq_len:] 
+            for sample in iterator:
+                # Handle different column names (text vs content)
+                text = sample.get("text", "") or sample.get("content", "")
                 
-                input_ids = torch.tensor(chunk, dtype=torch.long)
+                if not text or len(text.strip()) < 2: 
+                    continue
+
+                tokens = tokenizer.encode(text, add_special_tokens=False)
                 
-                yield {
-                    "input_ids": input_ids,
-                    "labels": input_ids.clone() 
-                }
-    # 5. Create the Iterable Dataset
-    packed_dataset = IterableDataset.from_generator(packed_generator)
+                buffer.extend(tokens)
+                buffer.append(eos_id)
+
+                # Yield chunks of exactly seq_len
+                while len(buffer) >= seq_len:
+                    chunk = buffer[:seq_len]
+                    buffer = buffer[seq_len:] 
+                    
+                    input_ids = torch.tensor(chunk, dtype=torch.long)
+                    
+                    yield {
+                        "input_ids": input_ids,
+                        "labels": input_ids.clone() 
+                    }
+            
+            # If VALIDATION, stop here (we don't want infinite validation loops)
+            if split != "train":
+                break
+            # If TRAINING, the loop restarts automatically (Infinite)
+
+    # 5. Create the Iterable Dataset (Compatibility Mode)
+    # Checks if the user has the new HF method. If not, uses a standard PyTorch wrapper.
+    if hasattr(HFIterableDataset, "from_generator"):
+        packed_dataset = HFIterableDataset.from_generator(packed_generator)
+    else:
+        class PyTorchPackedDataset(TorchIterableDataset):
+            def __init__(self, generator):
+                self.generator = generator
+            def __iter__(self):
+                return self.generator()
+        
+        packed_dataset = PyTorchPackedDataset(packed_generator)
 
     # 6. Create DataLoader
     return DataLoader(
@@ -118,56 +137,3 @@ def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size,
         num_workers=num_workers, 
         pin_memory=True
     )
-    
-# def create_pg19_dataloader(tokenizer, seq_len, batch_size, split="train"):
-#     """
-#     Streams PG19 books, tokenizes them, and packs them into contiguous chunks of seq_len.
-#     This ensures no padding is used, maximizing efficient training.
-#     """
-#     # Load PG19 in streaming mode to avoid downloading 11GB+ immediately
-#     dataset = datasets.load_dataset("pg19", split=split, streaming=True)
-
-#     # Get the EOS Token ID 
-#     eos_token_id = tokenizer.eos_token_id
-#     if eos_token_id is None:
-#         # Fallback if tokenizer doesn't have an EOS defined (rare, but happens)
-#         print("Warning: Tokenizer has no eos_token_id. Using 0.")
-#         eos_token_id = 0
-        
-#     def data_generator():
-#         buffer = []
-#         for sample in dataset:
-#             text = sample['text']
-#             # Skip short texts
-#             if len(text) < 1000: continue
-            
-#             tokens = tokenizer(text, add_special_tokens = False).input_ids
-            
-#             buffer.extend(tokens)
-#             buffer.append(eos_token_id)
-            
-#             # Yield chunks of seq_len
-#             while len(buffer) >= seq_len:
-#                 chunk = buffer[:seq_len]
-#                 buffer = buffer[seq_len:]
-                
-#                 # Convert to tensor
-#                 input_ids = torch.tensor(chunk, dtype=torch.long)
-#                 # Labels are same as input (causal LM)
-#                 yield {"input_ids": input_ids, "labels": input_ids}
-                
-#     # Create iterable dataset
-#     iterable_dataset = datasets.IterableDataset.from_generator(data_generator)
-    
-#     # Simple collator
-#     def collate_fn(examples):
-#         return {
-#             "input_ids": torch.stack([e["input_ids"] for e in examples]),
-#             "labels": torch.stack([e["labels"] for e in examples])
-#         }
-
-#     return torch.utils.data.DataLoader(
-#         iterable_dataset, 
-#         batch_size=batch_size, 
-#         collate_fn=collate_fn
-#     )

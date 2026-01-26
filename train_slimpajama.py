@@ -2,15 +2,15 @@ import sys
 import os
 import math
 import torch
-from transformers import get_cosine_schedule_with_warmup
 import argparse
+import warnings
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torchmetrics import MeanMetric
-from torchmetrics.text import Perplexity
 from rich.live import Live
 from rich.panel import Panel
 from rich.console import Group
+from transformers import get_cosine_schedule_with_warmup
 
 # --- LOCAL IMPORTS ---
 from model import model_loader
@@ -18,83 +18,93 @@ from dataset import data_loader
 import utils
 import datasets
 import transformers
-import warnings
 
-# Disable Hugging Face progress bars and set logging to error only
+# Silence verbose logging
 datasets.disable_progress_bar()
 datasets.utils.logging.set_verbosity_error()
 transformers.utils.logging.set_verbosity_error()
-
-# Silence the specific Torch distributed warning seen in your logs
 warnings.filterwarnings("ignore", message=".*barrier().*")
 
 # ===============================
-# 1. Argument Parsing
+# 1. Generation Helper
+# ===============================
+def log_sample_generation(model, tokenizer, accelerator, global_step, prompt="The meaning of life is"):
+    """Generates a sample and logs it to TensorBoard and Console."""
+    model.eval()
+    device = next(model.parameters()).device
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids, 
+                max_new_tokens=50,
+                do_sample=True,
+                temperature=0.8,
+                top_k=40,
+                pad_token_id=tokenizer.eos_token_id
+            )
+        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    except Exception as e:
+        generated_text = f"Generation failed: {e}"
+
+    model.train()
+
+    if accelerator.is_main_process:
+        print(f"\n[Step {global_step}] Sample: {generated_text}\n")
+        tracker = accelerator.get_tracker("tensorboard")
+        if tracker:
+            tracker.writer.add_text("Samples", f"**Step {global_step}:**\n\n{generated_text}", global_step)
+    
+    return generated_text
+
+# ===============================
+# 2. Argument Parsing
 # ===============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="LLM Training Script")
-
-    # Dataset 
-    parser.add_argument("--dataset", type=str, default="slimpajama_6b", 
-                        help="Name of dataset ('slimpajama_6b') or path to local file ('./data/train.jsonl')")
-    parser.add_argument("--val_dataset", type=str, default="slimpajama_6b", help="Dataset to use for validation")
+    parser = argparse.ArgumentParser(description="SlimPajama Training Script")
+    
+    # Dataset
+    parser.add_argument("--dataset", type=str, default="slimpajama_6b")
+    parser.add_argument("--val_dataset", type=str, default="slimpajama_6b")
 
     # Model Configuration 
-    parser.add_argument("--model_type", type=str, default="long", 
-                        choices=["holo", "gpt2", "mamba", "mamba2", "long"], # <--- Added 'long' here
-                        help="Type of model to train")
-    parser.add_argument("--model_size", type=str, default="187m", 
-                        help="Model size preset (e.g. small, medium, 187m)")
+    parser.add_argument("--model_type", type=str, default="long", choices=["holo", "gpt2", "mamba", "mamba2", "long"])
+    parser.add_argument("--model_size", type=str, default="187m")
     
     # Hyperparameters
-    parser.add_argument("--batch_size", type=int, default=2, help="Per-device batch size")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--max_steps", type=int, default=5000, help="Total training steps")
-    parser.add_argument("--seq_len", type=int, default=2048, help="Sequence length (context window)")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps for scheduler")
-    parser.add_argument("--save_steps", type=int, default=500, help="Steps interval for saving checkpoints")
-    parser.add_argument("--eval_steps", type=int, default=50, help="Run evaluation every X steps")
-
-    # Optimization
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing to save memory")    
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--grad_accum_steps", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--eval_steps", type=int, default=250)
 
     # Checkpointing
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint (e.g. 'latest' or './checkpoints/step_500')")
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/long_187m", help="Directory to save checkpoints")
-    parser.add_argument("--output_dir", type=str, default="./output/long_187m", help="Directory to save the final model")
-    
-    parser.add_argument("--log_dir", type=str, default="./logs", help="Directory for TensorBoard logs")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/slimpajama_long")
+    parser.add_argument("--output_dir", type=str, default="./output/slimpajama_long")
+    parser.add_argument("--log_dir", type=str, default="./logs/slimpajama")
     
     return parser.parse_args()
 
 args = parse_args()
 
 # ===============================
-# 2. Setup Accelerator & Logging
+# 3. Setup Accelerator
 # ===============================
-accelerator = Accelerator(
-    gradient_accumulation_steps=args.grad_accum_steps,
-    # mixed_precision="bf16", # Uncomment if you want to hardcode, otherwise set via 'accelerate config'
-    log_with="tensorboard",
-    project_dir="."
-)
+accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps, log_with="tensorboard", project_dir=".")
 set_seed(42)
 console = utils.get_console(accelerator)
 
-if args.model_type == "mamba" and accelerator.mixed_precision == "no":
-    if accelerator.is_main_process:
-        console.print("[bold red]WARNING: Training Mamba in FP32 (no mixed precision) can be very slow or unstable. Please set --bf16/f16 on accelerate config if possible.[/bold red]")
-
 if accelerator.is_main_process:
     utils.print_config_table(console, accelerator, args)
-    console.print(f"[bold green]Starting Training for {args.model_type.upper()} ({args.model_size})...[/bold green]")
-
 
 # ===============================
-# 3. Load Model & Tokenizer
+# 4. Load Model & Data
 # ===============================
-# We load the model FIRST to get the tokenizer, which we then pass to the data loader
 model, tokenizer = model_loader.get_model_and_tokenizer(
     model_type=args.model_type,
     model_size=args.model_size,
@@ -102,165 +112,53 @@ model, tokenizer = model_loader.get_model_and_tokenizer(
     device=accelerator.device
 )
 
-# Apply Gradient Checkpointing if requested
-if args.gradient_checkpointing:
-    model.gradient_checkpointing_enable()
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
 
-# ===============================
-# 4. Load Data
-# ===============================
-train_loader = data_loader.get_dataloader(
-    console, accelerator, tokenizer, # <--- Passing tokenizer here
-    args.dataset, args.batch_size, args.seq_len, split="train"
-)
-
-val_loader = data_loader.get_dataloader(
-    console, accelerator, tokenizer, # <--- Passing tokenizer here
-    args.val_dataset, args.batch_size, args.seq_len, split="validation"
-)
+train_loader = data_loader.get_dataloader(console, accelerator, tokenizer, args.dataset, args.batch_size, args.seq_len, split="train")
+val_loader = data_loader.get_dataloader(console, accelerator, tokenizer, args.val_dataset, args.batch_size, args.seq_len, split="validation")
 
 # ===============================
 # 5. Optimizer & Scheduler
 # ===============================
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
-scheduler = get_cosine_schedule_with_warmup(
-    optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
-)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps)
 
-# Prepare with Accelerator
-model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
-    model, optimizer, train_loader, val_loader, scheduler
-)
+model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
 
-# Metrics
 loss_metric = MeanMetric().to(accelerator.device)
 
 # ===============================
-# 6. Resume Logic
-# ===============================
-global_step = 0
-resume_step = 0
-
-if args.resume_from_checkpoint:
-    path = args.resume_from_checkpoint
-
-    # Automatic 'latest' detection
-    if path == "latest":
-        chk_dir = args.checkpoint_dir
-        if os.path.exists(chk_dir):
-            folders = [os.path.join(chk_dir, d) for d in os.listdir(chk_dir) if d.startswith("step_")]
-            if folders:
-                folders.sort(key=lambda x: int(x.split("_")[-1]))
-                path = folders[-1]
-            else:
-                path = None 
-        else:
-            path = None
-
-    # Sync path across all processes to prevent one GPU starting while others wait
-    if path and os.path.exists(path):
-        # 1. Load the state (Weights, Optimizer, Scheduler)
-        # This must happen on ALL processes simultaneously
-        accelerator.load_state(path)
-        
-        # 2. Extract step number for logging and skipping
-        try:
-            resume_step = int(os.path.basename(path).split("_")[-1])
-            global_step = resume_step
-        except ValueError:
-            resume_step = 0
-
-        if accelerator.is_main_process:
-            console.print(f"[bold yellow]Resuming training from: {path} (Step: {resume_step})[/bold yellow]")
-
-        # 3. Synchronized Data Skipping
-        # We must skip resume_step * gradient_accumulation_steps to align the stream
-        # accelerator.skip_first_batches handles the sync across GPUs automatically
-        active_dataloader = accelerator.skip_first_batches(train_loader, resume_step * args.grad_accum_steps)
-        
-        if accelerator.is_main_process:
-            console.print(f"[dim]Skipping {resume_step * args.grad_accum_steps} total batches to resume at step {resume_step}...[/dim]")
-    else:
-        if accelerator.is_main_process:
-            console.print(f"[bold red]Checkpoint '{path}' not found. Starting from scratch.[/bold red]")
-        active_dataloader = train_loader
-else:
-    active_dataloader = train_loader
-
-# Ensure all processes are synced before entering the loop
-accelerator.wait_for_everyone()
-
-
-# ===============================
-# 7. The Evaluation Function
+# 6. Training Loop Logic
 # ===============================
 def evaluate(model, val_loader, max_eval_batches=50):
-    """
-    Runs a quick evaluation loop. 
-    We cap it at 50 batches to avoid waiting too long on huge datasets.
-    """
-    model.eval() # Switch to evaluation mode (disable dropout, etc.)
+    model.eval()
     losses = []
-    
-    # We create a new iterator for validation to ensure we start fresh or continue
     val_iter = iter(val_loader)
-    
-    with torch.no_grad(): # Disable gradient calculation (saves massive memory)
-        for i in range(max_eval_batches):
-            try:
-                batch = next(val_iter)
-            except StopIteration:
-                break
+    with torch.no_grad():
+        for _ in range(max_eval_batches):
+            try: batch = next(val_iter)
+            except StopIteration: break
             outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
-            # Gather loss from all GPUs
-            gathered_loss = accelerator.gather(outputs.loss).mean()
-            losses.append(gathered_loss.item())
-
-    model.train() # Switch back to training mode
+            losses.append(accelerator.gather(outputs.loss).mean().item())
+    model.train()
     return sum(losses) / len(losses) if losses else float("inf")
 
-# ===============================
-# 8. Training Loop
-# ===============================
-model.train()
-data_iter = iter(train_loader)
-
-# --- GLOBAL UI STATE VARIABLES ---
-# These hold the current content of the validation panel
+global_step = 0
 val_message = "[dim]Waiting for first evaluation...[/dim]"
-val_border_style = "dim" 
-last_eval_step = 0
+val_border_style = "dim"
 system_message = None
 
-# Setup Dashboard
-progress_bar = utils.create_progress_bar()
-
 if accelerator.is_main_process:
-    # Initialize TensorBoard with dynamic config
-    accelerator.init_trackers(args.log_dir, config=vars(args))    
+    accelerator.init_trackers(args.log_dir, config=vars(args))
+    progress_bar = utils.create_progress_bar()
     train_task_id = progress_bar.add_task("[green]Training...", total=args.max_steps)
-    live = Live(
-        console=console, 
-        refresh_per_second = 1,
-        redirect_stdout = True,  # Traps prints so they don't break UI
-        redirect_stderr = True   # Traps warnings so they don't break UI
-    )
+    live = Live(console=console, refresh_per_second=2, redirect_stdout=True, redirect_stderr=True)
     live.start()
-    
-    # Save tokenizer once at start (safe because it doesn't change)
-    if not os.path.exists(args.checkpoint_dir):
-        os.makedirs(args.checkpoint_dir)
 
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-        
-    tokenizer.save_pretrained(os.path.join(args.checkpoint_dir, "tokenizer"))
+# --- MAIN LOOP ---
+data_iter = iter(train_loader)
 
 try:
     while global_step < args.max_steps:
-        # --- A. TRAINING STEP ---
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -268,10 +166,8 @@ try:
             batch = next(data_iter)
 
         with accelerator.accumulate(model):
-            
             outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
-            loss = outputs.loss
-            accelerator.backward(loss)
+            accelerator.backward(outputs.loss)
             
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -280,152 +176,40 @@ try:
             scheduler.step()
             optimizer.zero_grad()
             
-            gathered_loss = accelerator.gather(loss.detach())
-            loss_metric.update(gathered_loss.mean())
+            loss_metric.update(accelerator.gather(outputs.loss.detach()).mean())
 
-        # --- B. POST-STEP LOGIC ---
         if accelerator.sync_gradients:
             global_step += 1
             
-            # 1. Metric Calculations
-            current_loss = loss_metric.compute().item()
-            try:
-                current_ppl = math.exp(current_loss)
-            except OverflowError:
-                current_ppl = float("inf")
-            current_lr = scheduler.get_last_lr()[0]
-
-            # 2. UI UPDATE (The "Global Panel" Logic)
+            # UI Update
             if accelerator.is_main_process:
-                progress_bar.update(train_task_id, completed=global_step)
+                current_loss = loss_metric.compute().item()
+                current_lr = scheduler.get_last_lr()[0]
+                metrics_panel = utils.create_metrics_table(global_step, args.max_steps, current_loss, math.exp(current_loss), current_lr)
                 
-                # Create the tables/panels using the current state variables
-                metrics_panel = utils.create_metrics_table(
-                    global_step, args.max_steps, current_loss, current_ppl, current_lr
-                )
-                
-                # We always create the panel here, using the global 'val_message' variable
-                val_panel = Panel(
-                    val_message, 
-                    title="Validation Status", 
-                    border_style=val_border_style,
-                    width=60
-                )
-
-                # --- NEW: Build the UI Group dynamically ---
-                ui_elements = [metrics_panel, val_panel]
-                # If there is a system message (like saving), add it to the stack
-                if system_message:
-                    ui_elements.append(Panel(system_message, border_style="yellow", title="System"))
+                ui_elements = [metrics_panel, Panel(val_message, title="Validation", border_style=val_border_style, width=60)]
+                if system_message: ui_elements.append(Panel(system_message, border_style="yellow"))
                 ui_elements.append(progress_bar)
                 
+                progress_bar.update(train_task_id, completed=global_step)
                 live.update(Group(*ui_elements))
+                accelerator.log({"train_loss": current_loss, "lr": current_lr}, step=global_step)
 
-            
-            # 3. Log Training Data
-            accelerator.log({
-                "train_loss": current_loss, 
-                "train_ppl": current_ppl, 
-                "lr": current_lr
-            }, step=global_step)
-            
-            # --- C. EVALUATION TRIGGER ---
+            # Evaluation
             if global_step % args.eval_steps == 0:
-                
-                # 1. Update State to "Running" & Force Refresh
-                if accelerator.is_main_process:
-                    val_message = "[bold yellow]Running Evaluation... (Please Wait)[/bold yellow]"
-                    val_border_style = "yellow"
-                    
-                    # Force an immediate update so the user sees "Running..." right now
-                    live.update(Group(
-                        metrics_panel, 
-                        Panel(val_message, title="Validation Status", border_style=val_border_style, width=60), 
-                        progress_bar
-                    ))
-                
-                # 2. Run Evaluation
                 val_loss = evaluate(model, val_loader)
-                val_ppl = math.exp(val_loss) if val_loss < 20 else float("inf")
-                last_eval_step = global_step
+                log_sample_generation(model, tokenizer, accelerator, global_step)
                 
-                accelerator.log({"val_loss": val_loss, "val_ppl": val_ppl}, step=global_step)
-
-                # 3. Update State to "Result"
-                # The next loop iteration will pick this up automatically, keeping the UI persistent
                 if accelerator.is_main_process:
-                    val_message = f"[bold cyan]Last Eval (Step {last_eval_step}):[/bold cyan]\nLoss: {val_loss:.4f} | PPL: {val_ppl:.2f}"
-                    val_border_style = "cyan"        
-                    
+                    val_message = f"Step {global_step} | Loss: {val_loss:.4f} | PPL: {math.exp(val_loss):.2f}"
+                    val_border_style = "cyan"
+                    accelerator.log({"val_loss": val_loss}, step=global_step)
 
-            # --- D. SAVE TRIGGER ---
+            # Save
             if global_step % args.save_steps == 0:
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    system_message = f"[bold yellow]Saving checkpoint to step_{global_step}...[/bold yellow]"                     
-                    live.update(Group(metrics_panel, val_panel, Panel(system_message, border_style="yellow"), progress_bar))
-                    
-                accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
-                
-                if accelerator.is_main_process:
-                    system_message = None
-                    
-                accelerator.wait_for_everyone()
+                accelerator.save_state(os.path.join(args.checkpoint_dir, f"step_{global_step}"))
 
-    # Final Save (End of Loop)
-    accelerator.wait_for_everyone()
-
-    if accelerator.is_main_process:
-        # Update UI to show we are in final phase
-        console.print("[bold yellow]Training Complete. Running Final Evaluation...[/bold yellow]")
-        
-    # --- Final Eval on Train Split ---
-    # We use a larger batch count (e.g., 100) for a more stable final number
-    final_train_loss = evaluate(model, train_loader, max_eval_batches=100)
-    final_train_ppl = math.exp(final_train_loss) if final_train_loss < 20 else float("inf")
-
-    # --- Final Eval on Validation Split ---
-    final_val_loss = evaluate(model, val_loader, max_eval_batches=100)
-    final_val_ppl = math.exp(final_val_loss) if final_val_loss < 20 else float("inf")
-    
-    if accelerator.is_main_process:
-        live.stop() # Stop the live display to print the final static summary
-        
-        # 1. Final Model Saving
-        console.print("[bold blue]Saving final model weights...[/bold blue]")
-        unwrapped_model = accelerator.unwrap_model(model)
-        
-        final_save_path = args.output_dir
-        
-        unwrapped_model.save_pretrained(
-            final_save_path, 
-            is_main_process=accelerator.is_main_process, 
-            save_function=accelerator.save,
-            safe_serialization=False
-        )
-        
-        tokenizer.save_pretrained(final_save_path)
-        
-        # 2. Final Results Summary Table
-        from rich.table import Table
-        from rich.box import DOUBLE_EDGE
-        summary_table = Table(title="[bold green]Final Training Summary[/bold green]", box = DOUBLE_EDGE)
-        summary_table.add_column("Split", style="cyan")
-        summary_table.add_column("Loss", style="magenta")
-        summary_table.add_column("Perplexity", style="magenta")
-
-        summary_table.add_row("Training", f"{final_train_loss:.4f}", f"{final_train_ppl:.2f}")
-        summary_table.add_row("Validation", f"{final_val_loss:.4f}", f"{final_val_ppl:.2f}")
-
-        console.print(summary_table)
-        console.print(f"[bold green]✅ Model and Tokenizer saved to: {final_save_path}[/bold green]")
-        
 finally:
     if accelerator.is_main_process:
-        try:
-            live.stop()
-        except:
-            pass
+        live.stop()
     accelerator.end_training()
-    if accelerator.is_main_process:
-        console.print("[bold green]Script Finished![/bold green]")
