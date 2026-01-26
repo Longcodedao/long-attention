@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union
+import math
 
 from .config import LongConfig
 from .ops import recurrent_scan, chunked_parallel_scan, parallel_scan
@@ -38,10 +39,44 @@ class LongAttention(nn.Module):
         self.mem_norm = nn.GroupNorm(self.num_heads, self.d_model, eps=1e-5)
 
     def reset_parameters(self):
-        # Init
-        nn.init.constant_(self.input_gate_proj.bias, self.config.gate_init_bias) 
-        # nn.init.constant_(self.gamma_proj.bias, self.config.gate_bias_init)       
+        # Standard Projections: Xavier/Kaiming
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.o_proj.weight)
 
+        # 2. Gate Bias: We want to intialize it to open or close (input gate)
+        # to feed in a memory
+        # 0.0 -> Sigmoid(0.0) = 0.5 (Neutral)
+        # 2.0 -> Sigmoid(2.0) = 0.88 (Mostly Open)
+        nn.init.constant_(self.input_gate_proj.bias, self.config.gate_init_bias) 
+
+        # 3. Gamma Intialization: Multi-Spectral Geometric Style
+        # Instead of linear gamma, we distribute "Time Scales" geometrically.
+        # Head 1 remembers 10 tokens. Head N remembers 10,000 tokens
+        min_decay = 0.9
+        max_decay = 0.9999
+
+        # Log-space interpolation prevents "clumping" near 1.0
+        target_decays = 1 - torch.exp(
+            torch.linspace(
+                math.log(1 - min_decay), 
+                math.log(1 - max_decay), 
+                self.num_heads
+            )
+        )
+
+        # 4. Calculate the Inverse Sigmoid (Logit)
+        # b = log(p / (1-p))
+        gamma_bias_init = torch.log(target_decays / (1 - target_decays))
+        
+        # 5. Apply to the Layer
+        # Zero out the weight so input x doesn't disturb the initial state
+        nn.init.zeros_(self.gamma_proj.weight)
+        with torch.no_grad():
+            self.gamma_proj.bias.copy_(gamma_bias_init)
+            
+        
     def forward(self, x, state=None):
         B, T, C = x.shape
         kernel_size = self.config.conv_kernel
@@ -174,17 +209,73 @@ class AnchorAttention(nn.Module):
         
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(out), next_state
-        
 
+
+        
+# We want to add the Token Shifting (Like in the RWKV) so that we can give the model 
+# a "Short-Term Memory" Shift. The MLP now processes a mixed representation
+# rather than individual word. This can compensate the Fuzzy and Compressed of 
+# Linear Attention
 class LongMLP(nn.Module):
     def __init__(self, config: LongConfig):
         super().__init__()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.d_model = config.hidden_size
+        self.intermediate = config.intermediate_size
 
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x)))
+        # 1. The Mixing Parameter (Per Channel or Scalar)
+        # We use a per-channel mix for maximum expressivity (like RWKV)
+        self.time_mix_k = nn.Parameter(torch.ones(1, 1, self.d_model) * 0.5)
+        self.time_mix_r = nn.Parameter(torch.ones(1, 1, self.d_model) * 0.5)
+
+        self.w_gate = nn.Linear(self.d_model, self.intermediate, bias=False)
+        self.w_val  = nn.Linear(self.d_model, self.intermediate, bias=False)
+        self.w_out  = nn.Linear(self.intermediate, self.d_model, bias=False)
+        
+    
+    def forward(self, x, state = None):
+        # x: [Batch, Time, Channel]
+        B, T, C = x.size()
+        
+        # --- A. Handling the Shift ---
+        if state is not None:
+            # INFERENCE MODE (Step-by-step)
+            # state contains the token from the PREVIOUS STEP
+            last_x = state 
+        
+            # Mix: current x + last x
+            # We mix differently for Gate and Value
+            x_gate = x * self.time_mix_k + last_x * (1 - self.time_mix_k)
+            x_val = x * self.time_mix_r + last_x * (1 - self.time_mix_r)
+        
+            next_state = x.detach()
+        
+        else:
+            # [A, B, C] -> [0, A, B]
+            x_prev = torch.cat([torch.zeros_like(x[:, :1, :]), x[:, :-1, :]], dim = 1)
+            x_gate = x * self.time_mix_k + x_prev * (1 - self.time_mix_k)
+            x_val = x * self.time_mix_r + x_prev * (1 - self.time_mix_r)
+        
+            next_state = None
+        
+        # --- B. The SwiGLU Calculation ---
+        # Gate (controlling information flow)
+        gate = F.silu(self.w_gate(x_gate))
+        val = self.w_val(x_val)
+        
+        out = self.w_out (gate * val)
+        
+        return out, next_state
+
+
+# class LongMLP(nn.Module):
+#     def __init__(self, config: LongConfig):
+#         super().__init__()
+#         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+#         self.act = nn.GELU()
+#         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+#     def forward(self, x):
+#         return self.fc2(self.act(self.fc1(x)))
 
 
 
@@ -199,9 +290,9 @@ class LongBlock(nn.Module):
         
         # 1. Determine Attention Type (Hybrid Logic)
         # layer_idx is 0-indexed here
-        is_anchor = (config.hybrid_ratio > 0) and ((layer_idx + 1) % config.hybrid_ratio == 0)
+        self.is_anchor = (config.hybrid_ratio > 0) and ((layer_idx + 1) % config.hybrid_ratio == 0)
         
-        if is_anchor:
+        if self.is_anchor:
             self.attn = AnchorAttention(config)
         else:
             self.attn = LongAttention(config)
@@ -214,22 +305,46 @@ class LongBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]]]:
+            self,
+            hidden_states: torch.Tensor,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            use_cache: bool = False,
+        ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]]]:
         
-        # --- Attention Sub-block ---
+        # --- 0. State Unpacking ---
+        # The incoming past_key_value is a Tuple: (Attention_State, MLP_State)
+        attn_state = None
+        mlp_state = None
+
+        if past_key_value is not None:
+            # Unpack the tuple automatically
+            attn_state, mlp_state = past_key_value
+
+        # --- 1. Attention Sub-block ---
         residual = hidden_states
         hidden_states = self.ln1(hidden_states)
         
-        attn_output, next_state = self.attn(hidden_states, state=past_key_value)
+        # We pass the specific attn_state.
+        # If LongAttention: attn_state is (RNN_State, Conv_Cache)
+        # If AnchorAttention: attn_state is (K_Cache, V_Cache)
+        attn_output, next_attn_state = self.attn(hidden_states, state=attn_state)
+        
         hidden_states = residual + attn_output
 
-        # --- MLP Sub-block ---
+        # --- 2. MLP Sub-block ---
         residual = hidden_states
         hidden_states = self.ln2(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        
+        # We pass the specific mlp_state (Last Token for shifting)
+        mlp_output, next_mlp_state = self.mlp(hidden_states, state=mlp_state)
+        
+        hidden_states = residual + mlp_output
+
+        # --- 3. State Packing ---
+        # Bundle the new states together for the Model to store
+        if use_cache or past_key_value is not None:
+            next_state = (next_attn_state, next_mlp_state)
+        else:
+            next_state = None
 
         return hidden_states, next_state

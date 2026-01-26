@@ -57,32 +57,39 @@ class LongModel(LongPreTrainedModel):
     # by initialize it to zeros, we ensure the model 
     # starts with a "clean state" memory
     def get_initial_state(self, batch_size: int, device: torch.device):
-        """
-        Creates the 'zero' state for both Recurrent memory and Conv cache 
-        for every layer in the model
-        """
         past_key_values = []
-        for layer in self.layers:
-            
-            # 1. Recurrent State: [B, H, D_head, D_head]
-            head_dim = self.config.hidden_size // self.config.num_heads
-            rnn_state = torch.zeros(
-                batch_size, 
-                self.config.num_heads,
-                head_dim, 
-                head_dim,
-                device = device
-            )
+        
+        for i, layer in enumerate(self.layers):
+            # 1. MLP State (Same for all layers)
+            # Just the previous token embedding [B, 1, C]
+            mlp_state = torch.zeros(batch_size, 1, self.config.hidden_size, device=device)
 
-            # 2. Conv Cache: [B, C, Kernel - 1]
-            conv_cache = torch.zeros(
-                batch_size, 
-                self.config.hidden_size, 
-                self.config.conv_kernel - 1,
-                device = device
-            )
+            # 2. Attention State (Depends on layer type)
+            if layer.is_anchor:
+                # --- Anchor Layer (Standard Attention) ---
+                # Initialize empty KV Cache
+                # Dimensions: [B, H, 0, D] (Length 0 initially)
+                k_cache = torch.empty(
+                    batch_size, self.config.num_heads, 0, layer.attn.head_dim, device=device
+                )
+                v_cache = torch.empty(
+                    batch_size, self.config.num_heads, 0, layer.attn.head_dim, device=device
+                )
+                attn_state = (k_cache, v_cache)
+            else:
+                # --- Long Layer (Linear Attention) ---
+                # Recurrent State [B, H, D, D]
+                rnn_state = torch.zeros(
+                    batch_size, self.config.num_heads, layer.attn.head_dim, layer.attn.head_dim, device=device
+                )
+                # Conv Cache [B, C, K-1]
+                conv_cache = torch.zeros(
+                    batch_size, self.config.hidden_size, self.config.conv_kernel - 1, device=device
+                )
+                attn_state = (rnn_state, conv_cache)
 
-            past_key_values.append((rnn_state, conv_cache))
+            # Pack them together
+            past_key_values.append((attn_state, mlp_state))
 
         return past_key_values
         
