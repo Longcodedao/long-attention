@@ -13,7 +13,8 @@ from transformers import (
 # Adjust these imports if your folder structure is slightly different
 from model.holo.configuration_holo import HoloConfig
 from model.holo.modeling_holo import HoloForCausalLM 
-from model.long import LongConfig, LongForCausalLM  # Ensure this path is correct
+# from model.long import LongConfig, LongForCausalLM  # Ensure this path is correct
+from model.long_new import LongConfig, LongHFModel
 from model.gpt2.gpt2_configs import get_gpt2_config_dict
 from model.mamba.mamba_configs import get_mamba_config_dict
 from model.mamba.mamba2_configs import get_mamba2_config_dict
@@ -149,7 +150,7 @@ def get_model_and_tokenizer(model_type,
             config.num_hidden_layers = 6
             config.num_heads = 8
 
-        model = LongForCausalLM(config)
+        model = LongHFModel(config)
             
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Choose 'gpt2', 'mamba', 'mamba2', 'holo', or 'long'.")
@@ -191,7 +192,7 @@ def load_model_from_path(model_type, model_path, device="cpu"):
 
         elif model_type.lower() == "long":
             config = LongConfig.from_pretrained(model_path)
-            model = LongForCausalLM.from_pretrained(model_path, config=config)
+            model = LongHFModel.from_pretrained(model_path, config=config)
             
         else:
              raise ValueError(f"Unknown model_type: {model_type}")
