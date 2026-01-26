@@ -26,6 +26,9 @@ class LongPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
 
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, LongModel):
             module.gradient_checkpointing = value
@@ -50,6 +53,39 @@ class LongModel(LongPreTrainedModel):
         
         self.post_init()
 
+    # Since we use the recurrent scan in Generation,
+    # by initialize it to zeros, we ensure the model 
+    # starts with a "clean state" memory
+    def get_initial_state(self, batch_size: int, device: torch.device):
+        """
+        Creates the 'zero' state for both Recurrent memory and Conv cache 
+        for every layer in the model
+        """
+        past_key_values = []
+        for layer in self.layers:
+            
+            # 1. Recurrent State: [B, H, D_head, D_head]
+            head_dim = self.config.hidden_size // self.config.num_heads
+            rnn_state = torch.zeros(
+                batch_size, 
+                self.config.num_heads,
+                head_dim, 
+                head_dim,
+                device = device
+            )
+
+            # 2. Conv Cache: [B, C, Kernel - 1]
+            conv_cache = torch.zeros(
+                batch_size, 
+                self.config.hidden_size, 
+                self.config.conv_kernel - 1,
+                device = device
+            )
+
+            past_key_values.append((rnn_state, conv_cache))
+
+        return past_key_values
+        
     def forward(
         self, 
         input_ids: torch.LongTensor, 
@@ -60,6 +96,8 @@ class LongModel(LongPreTrainedModel):
         next_cache = []
 
         # If past_key_values is None, create a list of Nones for convenience
+        # It will uses the parallel scan of the prompt at first then 
+        # generate it in sequence
         if past_key_values is None:
             past_key_values = [None] * len(self.layers)
 
@@ -117,6 +155,13 @@ class LongForCausalLM(LongPreTrainedModel, GenerationMixin):
     def get_output_embeddings(self):
         return self.lm_head
 
+
+    def get_initial_state(self, batch_size: int, device: Optional[torch.device] = None):
+        if device is None:
+            device = self.lm_head.weight.device
+
+        return self.long_model.get_initial_state(batch_size, device)
+    
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
@@ -156,12 +201,25 @@ class LongForCausalLM(LongPreTrainedModel, GenerationMixin):
         self, 
         input_ids, 
         past_key_values=None, 
+        attention_mask=None,
         **kwargs
     ):
+        # 1. If we have a past state, only feed the last token to the model 
+        # The model will use recurrent_scan for O(1) inference
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
+
+        # 2. If it's the very first step and no state exists, 
+        # we can choose to pre-initialize it or let the first forward 
+        # pass run in "Parallel Mode" to fill the cache.
+        #
+        # Note: In your LongAttention code, if past_key_values is None, 
+        # it runs parallel_scan. This is usually what you want for the 
+        # initial prompt, as it is much faster than recurrent steps.
         
         return {
             "input_ids": input_ids, 
             "past_key_values": past_key_values,
+            "attention+mask": attention_mask,
+            **kwargs
         }

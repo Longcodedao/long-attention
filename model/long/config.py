@@ -16,6 +16,8 @@ class LongConfig(PretrainedConfig):
         hybrid_ratio=0, # Set > 0 (e.g., 4) to enable Anchor Layers
         initializer_range=0.02,
         tie_word_embeddings=True,
+        gate_init_bias = 1.0,
+        use_cache = True
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -30,6 +32,8 @@ class LongConfig(PretrainedConfig):
         self.hybrid_ratio = hybrid_ratio
         self.initializer_range = initializer_range
         self.tie_word_embeddings = tie_word_embeddings
+        self.gate_init_bias = gate_init_bias
+        self.use_cache = use_cache
 
 def get_187m_config():
     return LongConfig(

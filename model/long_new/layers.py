@@ -30,7 +30,7 @@ class LongAttention(nn.Module):
         # Head 0 = 1.0 (Unitary/Static), Others = 0.9..0.999
         decays = torch.linspace(0.9, 0.999, self.num_heads)
         decays[0] = 1.0 
-        self.gamma = nn.Parameter(decays.view(1, 1, self.num_heads, 1), requires_grad=False)
+        self.gamma = nn.Parameter(decays.view(1, 1, self.num_heads, 1), requires_grad=True)
         
     def reset_parameters(self):
         # Born Open: +1.0 Bias

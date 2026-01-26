@@ -2,6 +2,7 @@ from transformers import PretrainedConfig
 
 class LongConfig(PretrainedConfig):
     model_type = "long_model"
+    
     def __init__(
         self,
         vocab_size=1000,
@@ -10,7 +11,7 @@ class LongConfig(PretrainedConfig):
         num_heads=4,
         hybrid_ratio=2, # Every 2nd layer is RoPE
         conv_kernel=3,
-        gate_bias_init=1.0,
+        gate_bias_init = 1.0,
         gate_act='relu',
         initializer_range=0.02,
         **kwargs

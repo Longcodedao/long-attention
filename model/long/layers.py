@@ -37,9 +37,10 @@ class LongAttention(nn.Module):
         self.grp_norm = nn.GroupNorm(self.num_heads, self.d_model)
         self.mem_norm = nn.GroupNorm(self.num_heads, self.d_model, eps=1e-5)
 
+    def reset_parameters(self):
         # Init
-        nn.init.constant_(self.input_gate_proj.bias, -0.5) 
-        nn.init.constant_(self.gamma_proj.bias, 3.0)       
+        nn.init.constant_(self.input_gate_proj.bias, self.config.gate_init_bias) 
+        # nn.init.constant_(self.gamma_proj.bias, self.config.gate_bias_init)       
 
     def forward(self, x, state=None):
         B, T, C = x.shape
