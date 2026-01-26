@@ -57,7 +57,7 @@ def get_187m_config():
         num_heads=12,
         expansion_ratio=8/3,   # Ensures intermediate_size = 2048
         conv_kernel=4,
-        hybrid_ratio=0         # Pure Linear Attention (fastest)
+        hybrid_ratio=4         # Pure Linear Attention (fastest)
     )
 
 # --- Verification ---

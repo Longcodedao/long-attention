@@ -166,7 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--hybrid_ratio", type=int, default=0, help="0 for pure linear, 4 for every 4th layer softmax")
+    parser.add_argument("--hybrid_ratio", type=int, default=4, help="0 for pure linear, 4 for every 4th layer softmax")
     parser.add_argument("--log_dir", type=str, default="runs/long_model_experiment")
 
     args = parser.parse_args()

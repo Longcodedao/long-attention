@@ -13,8 +13,8 @@ from transformers import (
 # Adjust these imports if your folder structure is slightly different
 from model.holo.configuration_holo import HoloConfig
 from model.holo.modeling_holo import HoloForCausalLM 
-# from model.long import LongConfig, LongForCausalLM  # Ensure this path is correct
-from model.long_new import LongConfig, LongHFModel
+from model.long import LongConfig, LongForCausalLM  # Ensure this path is correct
+# from model.long_new import LongConfig, LongHFModel
 from model.gpt2.gpt2_configs import get_gpt2_config_dict
 from model.mamba.mamba_configs import get_mamba_config_dict
 from model.mamba.mamba2_configs import get_mamba2_config_dict
@@ -126,9 +126,11 @@ def get_model_and_tokenizer(model_type,
         config = LongConfig(
             vocab_size=vocab_size,
             max_position_embeddings=seq_len,
-            hidden_size=768,
-            num_hidden_layers=12,
-            num_heads=12
+            hidden_size = 768,
+            num_hidden_layers = 12,
+            num_heads = 12,
+            # hybrid_ratio = 4
+            hybrid_ratio = 4
         )
 
         # Apply Presets
@@ -150,7 +152,7 @@ def get_model_and_tokenizer(model_type,
             config.num_hidden_layers = 6
             config.num_heads = 8
 
-        model = LongHFModel(config)
+        model = LongForCausalLM(config)
             
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Choose 'gpt2', 'mamba', 'mamba2', 'holo', or 'long'.")
@@ -192,7 +194,7 @@ def load_model_from_path(model_type, model_path, device="cpu"):
 
         elif model_type.lower() == "long":
             config = LongConfig.from_pretrained(model_path)
-            model = LongHFModel.from_pretrained(model_path, config=config)
+            model = LongForCausalLM.from_pretrained(model_path, config=config)
             
         else:
              raise ValueError(f"Unknown model_type: {model_type}")
