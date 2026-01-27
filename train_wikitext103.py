@@ -30,7 +30,7 @@ transformers.utils.logging.set_verbosity_error()
 warnings.filterwarnings("ignore", message=".*barrier().*")
 
 
-def log_sample_generation(model, tokenizer, accelerator, global_step, prompt="The history of"):
+def log_sample_generation(model, tokenizer, accelerator, global_step, prompt="The history of Vietnam is: "):
     """
     Generates a sample and logs it to TensorBoard and Console.
     Uses model.generate for robustness.
@@ -349,7 +349,7 @@ try:
                 # 2. Generate & Log Sample (NEW)
                 # Only run on main process to save time/compute
                 if accelerator.is_main_process:
-                   log_sample_generation(model, tokenizer, accelerator, global_step, prompt="The history of")
+                   log_sample_generation(model, tokenizer, accelerator, global_step, prompt="Ho Chi Minh is: ")
                 # last_eval_step = global_step
                 
                 accelerator.log({"val_loss": val_loss, "val_ppl": val_ppl}, step=global_step)

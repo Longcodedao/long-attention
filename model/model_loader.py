@@ -126,7 +126,8 @@ def get_model_and_tokenizer(model_type,
             hidden_size = 768,
             num_hidden_layers = 12,
             num_heads = 12,
-            hybrid_ratio = 4
+            hybrid_ratio = 4,
+            gate_init_bias = -2.0
         )
 
         if model_size == "small" or model_size == "187m":

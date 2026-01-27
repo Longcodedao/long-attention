@@ -1,0 +1,17 @@
+batch_size: 2
+checkpoint_dir: ./checkpoints/wikitext2
+dataset: wikitext-2
+eval_steps: 50
+grad_accum_steps: 8
+gradient_checkpointing: false
+log_dir: ./logs/wikitext2
+lr: 0.0005
+max_steps: 4000
+model_size: small
+model_type: long
+output_dir: ./output/wikitext2
+resume_from_checkpoint: null
+save_steps: 500
+seq_len: 1024
+val_dataset: wikitext-2
+warmup_steps: 200

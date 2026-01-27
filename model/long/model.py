@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import LongAttention, AnchorAttention, LongMLP, LongBlock
+from .layers import LongAttention, LongMLP, LongBlock
 from .config import LongConfig
 
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
@@ -11,29 +11,52 @@ from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutpu
 from typing import List, Optional, Tuple, Union
 
 
+
 class LongPreTrainedModel(PreTrainedModel):
     config_class = LongConfig
     base_model_prefix = "long_model"
-    _no_split_modules = ["LongBlock"]
-    supports_gradient_checkpointing = True
 
     def _init_weights(self, module):
+        """
+        Standard generic initialization for all basic layers.
+        """
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
 
-        if hasattr(module, "reset_parameters"):
-            module.reset_parameters()
+    def init_weights(self):
+        """
+        The Main Initialization Function.
+        """
+        # 1. Run the standard init on everything
+        # This sets all Linear/Conv layers to Normal(0, 0.02)
+        super().init_weights()
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, LongModel):
-            module.gradient_checkpointing = value
+        # 2. OVERRIDE with Custom Logic
+        # We iterate through the model, find our custom layers, and fix them.
+        res_scale = (2 * self.config.num_hidden_layers) ** -0.5
+        
+        for name, module in self.named_modules():
+            
+            # A. If it's your LongAttention layer, trigger its custom logic
+            if isinstance(module, LongAttention):
+                module.reset_parameters()
+                
+            # B. Residual Scaling (Optional but recommended for Deep Transformers)
+            # We apply this specifically to the output projections
+            if "o_proj" in name or "w_out" in name:
+                if isinstance(module, nn.Linear):
+                    with torch.no_grad():
+                        module.weight.data *= res_scale
 
-    
+                        
+
 class LongModel(LongPreTrainedModel):
     def __init__(self, config: LongConfig):
         super().__init__(config)
