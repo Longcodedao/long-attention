@@ -2,14 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import LongAttention, AnchorAttention, LongMLP, LongBlock
+# Updated imports to match our previous changes
+from .layers import LongBlock, RoPESelfAttention, LongAttention
 from .config import LongConfig
-
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 
 from typing import List, Optional, Tuple, Union
-
 
 class LongPreTrainedModel(PreTrainedModel):
     config_class = LongConfig
@@ -40,34 +39,36 @@ class LongModel(LongPreTrainedModel):
         self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
-        self.gradient_checkpointing = False  # Initialize flag
+        self.gradient_checkpointing = False
         
         self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
+        
         # Use ModuleList of Blocks
         self.layers = nn.ModuleList([
             LongBlock(config, i) for i in range(config.num_hidden_layers)
         ])
         
-        
         self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
         self.post_init()
 
-    # Since we use the recurrent scan in Generation,
-    # by initialize it to zeros, we ensure the model 
-    # starts with a "clean state" memory
     def get_initial_state(self, batch_size: int, device: torch.device):
+        """
+        Initializes the states for generation.
+        Returns a list of tuples: [(attn_state, mlp_state), ...]
+        """
         past_key_values = []
         
         for i, layer in enumerate(self.layers):
-            # 1. MLP State (Same for all layers)
-            # Just the previous token embedding [B, 1, C]
-            mlp_state = torch.zeros(batch_size, 1, self.config.hidden_size, device=device)
+            # 1. MLP State 
+            # Since LongMLP is now stateless (SwiGLU), we set this to None.
+            # We keep the slot in the tuple for compatibility with the forward signature.
+            mlp_state = None
 
             # 2. Attention State (Depends on layer type)
             if layer.is_anchor:
-                # --- Anchor Layer (Standard Attention) ---
-                # Initialize empty KV Cache
+                # --- Anchor Layer (RoPE Attention) ---
+                # Initialize empty KV Cache for standard attention
                 # Dimensions: [B, H, 0, D] (Length 0 initially)
                 k_cache = torch.empty(
                     batch_size, self.config.num_heads, 0, layer.attn.head_dim, device=device
@@ -78,11 +79,15 @@ class LongModel(LongPreTrainedModel):
                 attn_state = (k_cache, v_cache)
             else:
                 # --- Long Layer (Linear Attention) ---
-                # Recurrent State [B, H, D, D]
+                # Recurrent State: 
+                # Our scan is element-wise (RWKV style), so state is [B, H, D].
+                # (Not [B, H, D, D] which is for matrix expansion).
                 rnn_state = torch.zeros(
-                    batch_size, self.config.num_heads, layer.attn.head_dim, layer.attn.head_dim, device=device
+                    batch_size, self.config.num_heads, layer.attn.head_dim, device=device
                 )
+                
                 # Conv Cache [B, C, K-1]
+                # Used for the local 1D convolution
                 conv_cache = torch.zeros(
                     batch_size, self.config.hidden_size, self.config.conv_kernel - 1, device=device
                 )
@@ -103,8 +108,6 @@ class LongModel(LongPreTrainedModel):
         next_cache = []
 
         # If past_key_values is None, create a list of Nones for convenience
-        # It will uses the parallel scan of the prompt at first then 
-        # generate it in sequence
         if past_key_values is None:
             past_key_values = [None] * len(self.layers)
 
@@ -113,19 +116,19 @@ class LongModel(LongPreTrainedModel):
 
             # --- Gradient Checkpointing Logic ---
             if self.gradient_checkpointing and self.training:
-                # Checkpointing requires the inputs to have requires_grad=True 
-                # (usually 'x' does).
-                # We define a custom lambda/function to handle the args.
+                # Checkpointing requires inputs to have grad.
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return module(*inputs, past_state, False) # use_cache=False during training
+                        # inputs[0] is x, inputs[1] is past_state
+                        return module(inputs[0], past_key_value=inputs[1], use_cache=False)
                     return custom_forward
 
-                # Run checkpoint
-                # Note: 'use_reentrant=False' is generally recommended for newer PyTorch
+                # Note: We must pass past_state as an arg to checkpoint, 
+                # but checkpoint checks autograd on args. x has it, past_state usually doesn't.
                 x, layer_next_state = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
                     x,
+                    past_state,
                     use_reentrant=False 
                 )
             else:
@@ -189,6 +192,7 @@ class LongForCausalLM(LongPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss(ignore_index = -100)
@@ -211,22 +215,14 @@ class LongForCausalLM(LongPreTrainedModel, GenerationMixin):
         attention_mask=None,
         **kwargs
     ):
-        # 1. If we have a past state, only feed the last token to the model 
-        # The model will use recurrent_scan for O(1) inference
+        # 1. If we have a past state, only feed the last token to the model
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
 
-        # 2. If it's the very first step and no state exists, 
-        # we can choose to pre-initialize it or let the first forward 
-        # pass run in "Parallel Mode" to fill the cache.
-        #
-        # Note: In your LongAttention code, if past_key_values is None, 
-        # it runs parallel_scan. This is usually what you want for the 
-        # initial prompt, as it is much faster than recurrent steps.
-        
+        # 2. Return dictionary
         return {
             "input_ids": input_ids, 
             "past_key_values": past_key_values,
-            "attention+mask": attention_mask,
+            "attention_mask": attention_mask, # Fixed typo here (was attention+mask)
             **kwargs
         }

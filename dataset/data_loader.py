@@ -11,7 +11,7 @@ def load_data_source(name, split):
     elif name == "slimpajama_627b":
         return load_dataset("cerebras/SlimPajama-627B", split=split, streaming=True)
     elif name == "wikitext":
-        return load_dataset("wikitext", "wikitext-103-v1", split=split, streaming=True)
+        return load_dataset("Salesforce/wikitext", "wikitext-103-v1", split=split, streaming=True)
     elif name == "pg19":
         return load_dataset("emozilla/pg19", split=split, streaming=True)
     elif os.path.exists(name):
