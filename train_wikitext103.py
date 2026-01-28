@@ -21,7 +21,7 @@ from transformers import get_cosine_schedule_with_warmup
 from model import model_loader
 from dataset import data_loader
 import utils
-
+import torch.distributed as dist
 # Disable standard progress bars to let Rich handle the UI
 datasets.disable_progress_bar()
 datasets.utils.logging.set_verbosity_error()
