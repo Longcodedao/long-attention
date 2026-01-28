@@ -296,10 +296,10 @@ try:
                 else:
                     grad_norm_display = f"{total_norm:.2f}"
             
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                
             gathered_loss = accelerator.gather(loss.detach())
             loss_metric.update(gathered_loss.mean())
 
