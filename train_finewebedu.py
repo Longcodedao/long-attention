@@ -21,6 +21,8 @@ from transformers import get_cosine_schedule_with_warmup
 from model import model_loader
 from dataset import data_loader
 import utils
+import torch.distributed as dist
+
 
 datasets.disable_progress_bar()
 datasets.utils.logging.set_verbosity_error()
@@ -158,30 +160,43 @@ if args.gradient_checkpointing:
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
+
+# --- CONDITIONAL COMPILATION ---
+# Only compile if model_type is 'long', otherwise run standard PyTorch
+if args.model_type == "long":
+    if accelerator.is_main_process:
+        console.print(f"[bold green][Performance] Model Type is '{args.model_type}'. Applying torch.compile()...[/bold green]")
+        
+    # Check if DeepSpeed/DDP has wrapped the model
+    if hasattr(model, "module"):
+        # IMPORTANT: Compile the INNER module to avoid RecursionError with DeepSpeed Engine
+        model.module = torch.compile(model.module, mode="default")
+    else:
+        # Fallback for single-GPU/non-DeepSpeed runs
+        model = torch.compile(model, mode="default")
+else:
+    if accelerator.is_main_process:
+        console.print(f"[dim][Performance] Model Type is '{args.model_type}'. Skipping torch.compile.[/dim]")
+
+
 # ===============================
 # 5. Load Data
 # ===============================
 
-# --- CRITICAL FIX: UNIT CONVERSION ---
-# The DataLoader counts individual SEQUENCES (rows).
-# Resume Step counts OPTIMIZER UPDATES.
-# 1 Update = (Gradient Accumulation Steps) * (Batch Size) SEQUENCES.
-sequences_to_skip = resume_step * args.grad_accum_steps * args.batch_size
-
+# Note: Relies on Accelerator's native skipping, no fast_skip_batches arg
 train_loader = data_loader.get_dataloader(
     console, accelerator, tokenizer, 
     args.dataset, args.batch_size, args.seq_len, 
-    split="train",
-    num_workers=args.num_workers,
-    fast_skip_sequences=sequences_to_skip  # Passed correctly as sequence count
+    split="train"
 )
-
 val_loader = data_loader.get_dataloader(
     console, accelerator, tokenizer, 
     args.val_dataset, args.batch_size, args.seq_len, 
     split="validation",
-    num_workers=args.num_workers
 )
+
+
+accelerator.print("Data Loaders initialized. Preparing for distributed training...")
 
 # ===============================
 # 6. Optimizer & Scheduler
@@ -194,6 +209,11 @@ scheduler = get_cosine_schedule_with_warmup(
 model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
+
+# CRITICAL: Ensure all processes have finished 'preparing' before moving to state loading
+accelerator.wait_for_everyone()
+accelerator.print("Preparation complete. Moving to training loop.")
+
 
 if args.resume_from_checkpoint:
     if args.resume_from_checkpoint != "latest" or os.path.exists(args.checkpoint_dir):
@@ -209,8 +229,25 @@ loss_metric = MeanMetric().to(accelerator.device)
 # 7. Training Loop
 # ===============================
 model.train()
+
+# --- CORRECT DATA RESUMPTION LOGIC ---
+# We calculate how many "micro-batches" to skip.
+# Global Step = 1 Update.
+# 1 Update = (Gradient Accumulation) Batches.
+batches_to_skip = resume_step * args.grad_accum_steps
+
+if resume_step > 0:
+    if accelerator.is_main_process:
+        console.print(f"[bold yellow]Resuming Data: Skipping {batches_to_skip} micro-batches to match Step {resume_step}...[/bold yellow]")
+    
+    # This acts as a "Fast Forward" for the data loader using the official method
+    # It ensures the data iterator starts exactly where the model left off
+    active_dataloader = accelerator.skip_first_batches(train_loader, batches_to_skip)
+else:
+    active_dataloader = train_loader
+
+
 data_iter = iter(train_loader)
-val_iter = iter(val_loader) # Persistent iterator
 
 # UI State
 gen_text_display = "Waiting for first evaluation..."
@@ -299,6 +336,7 @@ try:
             if global_step % args.eval_steps == 0:
                 model.eval()
                 val_losses = []
+                val_iter = iter(val_loader)
                 for _ in range(20):
                     try:
                         vbatch = next(val_iter)
@@ -325,16 +363,45 @@ try:
             if global_step % args.save_steps == 0:
                 accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
 
+    # --- FINALIZE ---
     if accelerator.is_main_process:
         live.stop()
         console.print("[bold green]Training Complete! Saving final model...[/bold green]")
-        
+
     accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save, safe_serialization=False)
-    tokenizer.save_pretrained(args.output_dir)
+
+    # === FIX: Manual Unwrapping to bypass Accelerate/torch.compile crash ===
+    # This robust unwrap logic ensures we don't save the compiled container
+    unwrapped_model = model
+    
+    # 1. Unwrap DeepSpeed/DDP (recursively get .module)
+    while hasattr(unwrapped_model, "module"):
+        unwrapped_model = unwrapped_model.module
+        
+    # 2. Unwrap torch.compile (look for _orig_mod)
+    # Accelerate crashes here because it assumes _orig_mod is always in __dict__,
+    # but a simple getattr/hasattr check is much safer.
+    if hasattr(unwrapped_model, "_orig_mod"):
+        unwrapped_model = unwrapped_model._orig_mod
+
+    # 3. Save
+    unwrapped_model.save_pretrained(
+        args.output_dir, 
+        save_function=accelerator.save, 
+        safe_serialization=False
+    )
+    if tokenizer:
+        tokenizer.save_pretrained(args.output_dir)
+        
+    if accelerator.is_main_process:
+        console.print(f"[bold green]Model saved to {args.output_dir}[/bold green]")
 
 except KeyboardInterrupt:
     if accelerator.is_main_process:
         live.stop()
         console.print("[bold red]Training Interrupted![/bold red]")
+
+finally:
+    accelerator.end_training()
+    if dist.is_initialized():
+        dist.destroy_process_group()

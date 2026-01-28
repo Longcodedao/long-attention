@@ -112,7 +112,6 @@ def main():
             seq_len=args.seq_len,
             split=args.split,
             num_workers=2,
-            fast_skip_batches=0 # No skipping for eval
         )
     except ValueError as ve:
         if accelerator.is_main_process:
