@@ -16,7 +16,7 @@ class LongConfig(PretrainedConfig):
         hybrid_ratio=0, # Set > 0 (e.g., 4) to enable Anchor Layers
         initializer_range=0.02,
         tie_word_embeddings=True,
-        gate_init_bias=1.0,
+        gate_init_bias=-3.0,
         use_cache=True,
         **kwargs
     ):
