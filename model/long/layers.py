@@ -191,6 +191,8 @@ class LongAttention(nn.Module):
         
         return self.o_proj(out), (next_rnn_state, new_conv_cache)
 
+
+
 class LongMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
