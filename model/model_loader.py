@@ -27,6 +27,7 @@ def get_model_and_tokenizer(model_type,
     """
     Factory function to initialize a NEW model.
     """
+    torch.set_float32_matmul_precision('high')
     
     # 1. Initialize Tokenizer first
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -152,7 +153,8 @@ def get_model_and_tokenizer(model_type,
     model.to(device)
 
     if model_type.lower() == "long":
-         model = torch.compile(model, mode = "default")        
+        # Try max-autotune for getting the fastest in training
+        model = torch.compile(model, mode = "default")        
         
     return model, tokenizer
 
