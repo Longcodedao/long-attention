@@ -184,6 +184,13 @@ model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
 
+if args.model_type == "long":
+    if hasattr(model, "module"):
+        model.module = torch.compile(model.module, mode="default")
+    else:
+        model = torch.compile(model, mode="default")
+
+
 # --- LOAD STATE (Model + Optimizer + Scheduler) ---
 if args.resume_from_checkpoint:
     if args.resume_from_checkpoint != "latest" or os.path.exists(args.checkpoint_dir):
