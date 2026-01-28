@@ -24,12 +24,27 @@ def load_data_source(name, split):
         return load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split, streaming=True)
     elif name == "pg19":
         return load_dataset("emozilla/pg19", split=split, streaming=True)
+        
+    elif name == "fineweb-edu":
+        print(f"[Dataset] Loading FineWeb-Edu (10BT) and simulating '{split}' split...")
+        
+        # 1. Always load the base 'train' set
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+
+        val_size = 5000 
+
+        if split == "validation":
+            return ds.take(val_size)
+        else:
+            return ds.skip(val_size)
+            
     elif os.path.exists(name):
         return load_dataset("json", data_files=name, split=split, streaming=True)
     else:
         raise ValueError(f"Unknown dataset or path: {name}")
 
 def _packed_generator_func(raw_dataset, tokenizer_encode_func, eos_id, seq_len, 
+
                            batch_size, fast_skip_batches, dataset_name, 
                            num_processes, process_index, is_sharded, is_main_process):
     

@@ -32,30 +32,31 @@ warnings.filterwarnings("ignore", message=".*barrier().*")
 # 0. Monitoring Strategy: Evaluation Prompts
 # ===============================
 EVAL_PROMPTS = [
-    # 1. Wikipedia/Informative (General Knowledge)
-    "The Great Wall of China was primarily built to",
-    "Albert Einstein is most famous for his theory of",
-    
-    # 2. GitHub/Code (Tests the ~5% GitHub portion)
-    "import pandas as pd\n# Load a csv file into a dataframe\ndf =",
-    "function calculateDistance(x1, y1, x2, y2) {",
-    
-    # 3. StackExchange (Q&A / Logical Problem Solving)
-    "Question: How do I revert the last commit in Git? Answer: You can use",
-    "In mathematics, a prime number is a natural number greater than 1 that",
+    # 1. Scientific Definitions (Tests knowledge density)
+    "The three main states of matter are solid, liquid, and",
+    "In a eukaryotic cell, the DNA is primarily located within the",
+    "Photosynthesis is the process by which plants use sunlight to",
 
-    # 4. ArXiv/Books (Academic & Formal Writing)
-    "Abstract: This paper presents a novel approach to",
-    "The primary objective of the study was to investigate the relationship between",
+    # 2. Logical/Mathematical Continuity (Tests reasoning)
+    "If a triangle has a 90-degree angle, it is classified as a",
+    "To calculate the area of a rectangle, you multiply the length by the",
+    "In the equation 3x = 12, the value of x is",
 
-    # 5. C4/CommonCrawl (General Web & Fluency)
-    "To bake a chocolate cake, you must first gather your ingredients, which include",
-    "The quick brown fox jumps over", # Classic baseline for fluency
+    # 3. Technical/Coding (FineWeb-Edu is heavy on educational tutorials)
+    "In Python, a 'for' loop is used to iterate over a",
+    "HTML stands for HyperText Markup",
+    "To print a message to the console in JavaScript, you use",
 
-    # 6. Global Context (Refining your Vietnam prompt)
-    "The history of Vietnam is a long and complex narrative that includes"
+    # 4. Structured History/Social Science (Tests informative tone)
+    "The Great Depression began in 1929 after the crash of the",
+    "The primary cause of the seasons on Earth is the tilt of its",
+    "Democracy is a form of government where power is held by the",
+
+    # 5. Language & Grammar (Tests core linguistic structure)
+    "The antonym of 'expand' is",
+    "In the sentence 'The cat sat on the mat', the verb is",
+    "The plural form of the word 'criterion' is"
 ]
-
 def log_sample_generation(model, tokenizer, accelerator, global_step):
     """
     Picks a random prompt, generates text, and logs it to Console + TensorBoard.
@@ -98,8 +99,8 @@ def log_sample_generation(model, tokenizer, accelerator, global_step):
 # ===============================
 def parse_args():
     parser = argparse.ArgumentParser(description="Mamba/Transformer Training Script")
-    parser.add_argument("--dataset", type=str, default="slimpajama_6b", help="dataset name")
-    parser.add_argument("--val_dataset", type=str, default="slimpajama_6b", help="validation dataset name")
+    parser.add_argument("--dataset", type=str, default="fineweb-edu", help="dataset name")
+    parser.add_argument("--val_dataset", type=str, default="fineweb-edu", help="validation dataset name")
     parser.add_argument("--model_type", type=str, default="long", choices=["gpt2", "mamba", "mamba2", "long"], help="Model architecture")
     parser.add_argument("--model_size", type=str, default="small", help="Model size (small, medium, etc.)")
     
@@ -243,7 +244,10 @@ grad_norm_display = "0.0"
 progress_bar = utils.create_progress_bar()
 
 if accelerator.is_main_process:
-    accelerator.init_trackers(os.path.basename(args.log_dir), config=vars(args))
+    # Use normpath to strip trailing slashes before getting the basename
+    cleaned_log_name = os.path.basename(os.path.normpath(args.log_dir))
+    
+    accelerator.init_trackers(cleaned_log_name, config=vars(args))
     train_task_id = progress_bar.add_task("[green]Training...", total=args.max_steps)
     
     # Check Scheduler State (Sanity Check)
