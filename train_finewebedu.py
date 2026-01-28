@@ -248,14 +248,23 @@ try:
             loss = outputs.loss
             accelerator.backward(loss)
             
+            # Clip Gradients & Log Norm (Crucial for Mamba stability)
             if accelerator.sync_gradients:
+                # clip_grad_norm_ returns the norm before clipping
                 total_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                grad_norm_display = f"{total_norm.item():.2f}"
+                if isinstance(total_norm, torch.Tensor):
+                    grad_norm_display = f"{total_norm.item():.2f}"
+                else:
+                    grad_norm_display = f"{total_norm:.2f}"
             
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            gathered_loss = accelerator.gather(loss.detach())
+            loss_metric.update(gathered_loss.mean())
 
+            
         # --- Step Updates ---
         if accelerator.sync_gradients:
             global_step += 1
