@@ -122,7 +122,8 @@ class LongModel(LongPreTrainedModel):
     def forward(
         self, 
         input_ids: torch.LongTensor, 
-        past_key_values: Optional[List[torch.Tensor]] = None
+        past_key_values: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None
     ):
         
         x = self.wte(input_ids)
@@ -201,11 +202,13 @@ class LongForCausalLM(LongPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor, 
         past_key_values: Optional[List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]] = None, 
         labels: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         outputs = self.long_model(
             input_ids=input_ids,
-            past_key_values=past_key_values
+            past_key_values=past_key_values,
+            attention_mask = attention_mask
         )
 
         hidden_states = outputs.last_hidden_state

@@ -97,8 +97,8 @@ def chunked_parallel_scan(k, v, gate, gamma, chunk_size=128):
 
     # 3. Local Scan (Log-Space for Stability)
     # Cast to float64 for precision
-    u_chunk = (k_chunk * v_chunk * gate_chunk).to(torch.float64)
-    gamma_chunk = gamma_chunk.to(torch.float64)
+    u_chunk = (k_chunk * v_chunk * gate_chunk).to(torch.float32)
+    gamma_chunk = gamma_chunk.to(torch.float32)
 
     # Cumsum of log(gamma)
     log_gamma = torch.log(gamma_chunk + 1e-10)
@@ -116,7 +116,7 @@ def chunked_parallel_scan(k, v, gate, gamma, chunk_size=128):
     chunk_end_states = h_intra[:, :, -1] # [B, N, H, D]
     
     carry_states = []
-    last_carry = torch.zeros(B, H, D, device=k.device, dtype=torch.float64)
+    last_carry = torch.zeros(B, H, D, device=k.device, dtype=torch.float32)
 
     for i in range(num_chunks):
         carry_states.append(last_carry)

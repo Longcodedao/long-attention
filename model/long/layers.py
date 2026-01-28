@@ -85,31 +85,60 @@ class LongAttention(nn.Module):
             # Inference Mode: Use cache
             rnn_state, conv_cache = state
             
-            x_t = x.transpose(1, 2)
+            x_t = x.transpose(1, 2).contiguous()
             # Concatenate history [old_cache, new_input]
             conv_window = torch.cat([conv_cache, x_t], dim=2)
-            
+
+            conv_window = conv_window.contiguous()
             # Apply convolution
             # We take the last T steps of the valid output
-            x_conv = self.conv(conv_window)[:, :, :T].transpose(1, 2)
+            # x_conv = self.conv(conv_window)[:, :, :T].transpose(1, 2).contiguous()
+            x_conv = F.conv1d(
+                conv_window, 
+                self.conv.weight, 
+                bias = self.conv.bias, 
+                padding = 0, 
+                groups = self.d_model
+            )
+
+            x_conv = x_conv[:, :, :T].transpose(1, 2).contiguous()
             
             # Update cache: keep the last (kernel_size - 1) elements
             if self.config.conv_kernel > 1:
-                new_conv_cache = conv_window[:, :, 1:] 
+                new_conv_cache = conv_window[:, :, 1:].contiguous()
             else:
                 new_conv_cache = conv_cache # Should ideally be empty if kernel=1
         else:
+            # ### FIX 1: Add .contiguous() here ###
+            # This aligns memory layout so torch.compile doesn't crash on stride assertions
+            x_input = x.transpose(1, 2).contiguous()
+            
             # Training Mode: Full Sequence
             # Conv1d with padding=(k-1) results in shape L + k - 1. 
             # We slice [:, :, :T] to enforce causality (discard future leak).
-            x_conv = self.conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2)
+            # x_conv = self.conv(x_input)[:, :, :T].transpose(1, 2).contiguous
+
+            # FIX: Manual Padding allows torch.compile to trace layout correctly
+            # Pad strictly on the left (causal) -> (Left=Kernel-1, Right=0)
+            pad_amt = self.config.conv_kernel - 1
+            x_padded = F.pad(x_input, (pad_amt, 0))
+
+            x_conv = F.conv1d(
+                x_padded, 
+                self.conv.weight, 
+                bias=self.conv.bias, 
+                padding=0, 
+                groups=self.d_model
+            )
+            x_conv = x_conv[:, :, :T].transpose(1, 2).contiguous()
             
             rnn_state = None
             
             # Prepare cache for next step if we were to switch to inference
             if self.config.conv_kernel > 1:
                 # Cache the last k-1 tokens
-                new_conv_cache = x.transpose(1, 2)[:, :, -(self.config.conv_kernel-1):]
+                # Ensure conv_cache is contiguous for safety reasons
+                new_conv_cache = x.transpose(1, 2)[:, :, -(self.config.conv_kernel-1):].contiguous()
             else:
                 new_conv_cache = None
 
@@ -126,6 +155,7 @@ class LongAttention(nn.Module):
         i_gate = torch.sigmoid(self.input_gate_proj(x_conv)).view(B, T, self.num_heads, self.head_dim)
         gamma = torch.sigmoid(self.gamma_proj(x_conv)).view(B, T, self.num_heads, 1)
 
+        
         # --- 4. Scan Logic (SSM Core) ---
         if rnn_state is None:
             # Parallel training
@@ -136,6 +166,7 @@ class LongAttention(nn.Module):
             # Step-by-step inference
             mem, next_rnn_state = recurrent_scan(k, v, i_gate, gamma, rnn_state)
 
+        
         # --- 5. Output Projection & Gating ---
         # Normalize memory state before combining with Query
         mem_out = self.mem_norm(mem)

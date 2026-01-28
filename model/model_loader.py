@@ -150,6 +150,10 @@ def get_model_and_tokenizer(model_type,
         raise ValueError(f"Unknown model_type: {model_type}")
 
     model.to(device)
+
+    if model_type.lower() == "long":
+         model = torch.compile(model, mode = "default")        
+        
     return model, tokenizer
 
 # ... rest of your load_model_from_path remains the same ...
