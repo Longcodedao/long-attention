@@ -59,19 +59,20 @@ class LongAttention(nn.Module):
         nn.init.constant_(self.input_gate_proj.bias, self.config.gate_init_bias) 
 
         # Gamma Initialization (SSM style decay)
-        min_decay = 0.9
-        max_decay = 0.9999
-        target_decays = 1 - torch.exp(
-            torch.linspace(
-                math.log(1 - min_decay), 
-                math.log(1 - max_decay), 
-                self.num_heads
+        with torch.no_grad():
+            min_decay = 0.9
+            max_decay = 0.9999
+            target_decays = 1 - torch.exp(
+                torch.linspace(
+                    math.log(1 - min_decay), 
+                    math.log(1 - max_decay), 
+                    self.num_heads
+                )
             )
-        )
-        # Inverse sigmoid for bias init
-        gamma_bias_init = torch.log(target_decays / (1 - target_decays))
-        self.gamma_proj.bias.copy_(gamma_bias_init)
-        nn.init.zeros_(self.gamma_proj.weight)
+            # Inverse sigmoid for bias init
+            gamma_bias_init = torch.log(target_decays / (1 - target_decays))
+            self.gamma_proj.bias.copy_(gamma_bias_init)
+            nn.init.zeros_(self.gamma_proj.weight)
 
         # 3. Output Gate: Start NEUTRAL (Bias 0.0)
         nn.init.constant_(self.output_gate_proj.bias, 0.0)
