@@ -9,7 +9,7 @@ __all__ = [
     "LongPreTrainedModel", 
     "LongForCausalLM",
     "LongAttention", 
-    "AnchorAttention", 
+    "RoPESelfAttention", 
     "LongMLP",
     "chunked_parallel_scan", 
     "recurrent_scan",

@@ -17,6 +17,7 @@ from model.long import LongConfig, LongForCausalLM
 from model.gpt2.gpt2_configs import get_gpt2_config_dict
 from model.mamba.mamba_configs import get_mamba_config_dict
 from model.mamba.mamba2_configs import get_mamba2_config_dict
+from transformers import AutoConfig
 
 def get_model_and_tokenizer(model_type, 
                             model_size, 
@@ -127,7 +128,7 @@ def get_model_and_tokenizer(model_type,
             num_hidden_layers = 12,
             num_heads = 12,
             hybrid_ratio = 4,
-            gate_init_bias = 0.0
+            gate_init_bias = -3.0
         )
 
         if model_size == "small" or model_size == "187m":
@@ -152,3 +153,68 @@ def get_model_and_tokenizer(model_type,
     return model, tokenizer
 
 # ... rest of your load_model_from_path remains the same ...
+
+
+def load_model_from_path(model_path, model_type=None, device="cpu"):
+    """
+    Loads a saved model and tokenizer from a checkpoint directory.
+    
+    Args:
+        model_path (str): Path to the checkpoint folder (must contain config.json and pytorch_model.bin/safetensors).
+        model_type (str, optional): Explicitly enforce a model architecture ('long', 'holo', 'mamba', 'gpt2').
+                                    If None, attempts to infer it from config.json.
+        device (str): Device to load the model onto ('cpu', 'cuda', etc.).
+    """
+    print(f"[Model Loader] Loading model from: {model_path}")
+
+    # 1. Load Tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    except Exception as e:
+        print(f"[Model Loader] Warning: Could not load tokenizer from path ({e}). Defaulting to GPT2.")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 2. Determine Model Type
+    # If the user didn't provide a type, try to find it in the config file
+    if model_type is None:
+        try:
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            model_type = getattr(config, "model_type", "").lower()
+        except Exception:
+            print("[Model Loader] Warning: Could not read config.json to detect model type.")
+            model_type = ""
+    else:
+        model_type = model_type.lower()
+
+    print(f"[Model Loader] Architecture set to: {model_type}")
+
+    # 3. Dispatch to the correct Model Class
+    model = None
+
+    if model_type == "long":
+        model = LongForCausalLM.from_pretrained(model_path)
+
+    elif model_type == "holo":
+        model = HoloForCausalLM.from_pretrained(model_path)
+
+    elif model_type == "mamba":
+        model = MambaForCausalLM.from_pretrained(model_path)
+    
+    elif model_type == "mamba2":
+        model = Mamba2ForCausalLM.from_pretrained(model_path)
+
+    elif model_type == "gpt2":
+        model = GPT2LMHeadModel.from_pretrained(model_path)
+
+    else:
+        # Fallback for standard HF models (Llama, Mistral, etc.)
+        print(f"[Model Loader] Unrecognized custom type '{model_type}'. Attempting AutoModelForCausalLM...")
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+
+    # 4. Move to Device
+    model.to(device)
+    
+    return model, tokenizer

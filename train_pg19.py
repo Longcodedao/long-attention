@@ -126,8 +126,42 @@ scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.war
 model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
 loss_metric = MeanMetric().to(accelerator.device)
 
-# Resume logic (Omitted for brevity, keep your original logic here)
+# Resume logic 
 global_step = 0
+batches_to_skip = 0
+
+if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint != "":
+        accelerator.print(f"Resuming training from: {args.resume_from_checkpoint}")
+        
+        # 1. Load Model, Optimizer, and Scheduler states
+        accelerator.load_state(args.resume_from_checkpoint)
+        
+        # 2. Extract global_step from the folder name (assuming format ends in '/step_X')
+        try:
+            # defined as the last part of the path (e.g. "step_5000")
+            step_str = os.path.basename(os.path.normpath(args.resume_from_checkpoint))
+            global_step = int(step_str.split("_")[-1])
+        except ValueError:
+            accelerator.print("Warning: Could not parse global step from checkpoint path. Starting step count at 0.")
+
+        # 3. Skip the batches we have already trained on
+        #    Total batches = global_step * grad_accum_steps
+        batches_to_skip = global_step * args.grad_accum_steps
+        # train_loader = accelerator.skip_first_batches(train_loader, num_batches=initial_batches_to_skip)
+        
+        accelerator.print(f"  -> Resuming at Global Step {global_step}")
+        accelerator.print(f"  -> Will fast-forward {batches_to_skip} batches in Data Loader.")
+train_loader = data_loader.get_dataloader(console,
+                                          accelerator, 
+                                          tokenizer,
+                                          args.dataset, 
+                                          args.batch_size, 
+                                          args.seq_len, 
+                                          split="train",
+                                          fast_skip_batches = batches_to_skip)
+
+train_loader = accelerator.prepare(train_loader)
 data_iter = iter(train_loader)
 
 # UI Setup
@@ -191,6 +225,25 @@ try:
             if global_step % args.save_steps == 0:
                 accelerator.wait_for_everyone()
                 accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
+
+    # --- SAVE FINAL MODEL (ADDED) ---
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        console.print(f"\n[bold cyan]Training Finished! Saving final model to {args.output_dir}...[/bold cyan]")
+        
+        # Unwrap the model to remove accelerator/DDP wrappers
+        unwrapped_model = accelerator.unwrap_model(model)
+        
+        # Save model and tokenizer in Hugging Face format
+        unwrapped_model.save_pretrained(
+            args.output_dir, 
+            is_main_process=accelerator.is_main_process, 
+            save_function=accelerator.save
+        )
+        if tokenizer:
+            tokenizer.save_pretrained(args.output_dir)
+            
+        console.print(f"[bold green]✓ Model saved successfully to {args.output_dir}[/bold green]")
 
 finally:
     if accelerator.is_main_process:

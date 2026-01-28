@@ -5,10 +5,11 @@ from typing import Optional, Tuple, Union
 import math
 
 from .config import LongConfig
-from .ops import recurrent_scan, chunked_parallel_scan, parallel_scan
+# Ensure you have these ops available in your .ops file
+from .ops import recurrent_scan, chunked_parallel_scan
 
 class LongAttention(nn.Module):
-    def __init__(self, config: LongConfig):
+    def __init__(self, config):
         super().__init__()
         self.d_model = config.hidden_size
         self.num_heads = config.num_heads
@@ -21,6 +22,8 @@ class LongAttention(nn.Module):
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         
         # Local Conv 
+        # Causal padding is handled manually or via the 'padding' arg here depending on implementation
+        # For standard causal conv1d in training: padding = kernel - 1
         self.conv = nn.Conv1d(self.d_model, self.d_model, 
                               kernel_size=config.conv_kernel, 
                               groups=self.d_model, 
@@ -35,19 +38,27 @@ class LongAttention(nn.Module):
         # --- STABILITY: LayerNorm for V ---
         self.v_norm = nn.LayerNorm(self.head_dim)
         
-        # Output Norms
         self.grp_norm = nn.GroupNorm(self.num_heads, self.d_model)
-        self.mem_norm = nn.GroupNorm(self.num_heads, self.d_model, eps=1e-5)
+        self.mem_norm = nn.LayerNorm(self.head_dim)
+
+        self.reset_parameters()
 
     def reset_parameters(self):
+        """
+        Custom initialization logic.
+        """
+        # 1. Projections
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
         nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.o_proj.weight)
 
+        # 2. Input Gate: Start CLOSED (Bias -3.0 or similar)
+        # Prevents initial instability/explosive loss
+        nn.init.zeros_(self.input_gate_proj.weight)
         nn.init.constant_(self.input_gate_proj.bias, self.config.gate_init_bias) 
 
-        # Gamma Initialization
+        # Gamma Initialization (SSM style decay)
         min_decay = 0.9
         max_decay = 0.9999
         target_decays = 1 - torch.exp(
@@ -57,116 +68,114 @@ class LongAttention(nn.Module):
                 self.num_heads
             )
         )
+        # Inverse sigmoid for bias init
         gamma_bias_init = torch.log(target_decays / (1 - target_decays))
-        
+        self.gamma_proj.bias.copy_(gamma_bias_init)
         nn.init.zeros_(self.gamma_proj.weight)
-        with torch.no_grad():
-            self.gamma_proj.bias.copy_(gamma_bias_init)
-            
+
+        # 3. Output Gate: Start NEUTRAL (Bias 0.0)
+        nn.init.constant_(self.output_gate_proj.bias, 0.0)
+
     def forward(self, x, state=None):
         B, T, C = x.shape
-        kernel_size = self.config.conv_kernel
-
-        # --- 1. Local Convolution ---
+        
+        # --- 1. Local Convolution (Merged Logic) ---
         if state is not None:
+            # Inference Mode: Use cache
             rnn_state, conv_cache = state
             
-            x_t = x.transpose(1, 2) 
+            x_t = x.transpose(1, 2)
+            # Concatenate history [old_cache, new_input]
             conv_window = torch.cat([conv_cache, x_t], dim=2)
             
-            x_conv = F.conv1d(conv_window, self.conv.weight, self.conv.bias, groups=self.d_model)
-            x_conv = x_conv.transpose(1, 2) 
-            x_conv = F.silu(x_conv)
+            # Apply convolution
+            # We take the last T steps of the valid output
+            x_conv = self.conv(conv_window)[:, :, :T].transpose(1, 2)
             
-            if kernel_size > 1:
-                new_conv_cache = conv_window[:, :, 1:]
+            # Update cache: keep the last (kernel_size - 1) elements
+            if self.config.conv_kernel > 1:
+                new_conv_cache = conv_window[:, :, 1:] 
             else:
-                new_conv_cache = conv_cache 
+                new_conv_cache = conv_cache # Should ideally be empty if kernel=1
         else:
-            x_conv_full = self.conv(x.transpose(1, 2))
-            x_conv = x_conv_full[:, :, :T].transpose(1, 2) 
-            x_conv = F.silu(x_conv)
+            # Training Mode: Full Sequence
+            # Conv1d with padding=(k-1) results in shape L + k - 1. 
+            # We slice [:, :, :T] to enforce causality (discard future leak).
+            x_conv = self.conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2)
             
-            rnn_state = None 
-            if kernel_size > 1:
-                new_conv_cache = x.transpose(1, 2)[:, :, -(kernel_size - 1):]
-                if new_conv_cache.shape[2] < (kernel_size - 1):
-                    pad = (kernel_size - 1) - new_conv_cache.shape[2]
-                    new_conv_cache = F.pad(new_conv_cache, (pad, 0))
+            rnn_state = None
+            
+            # Prepare cache for next step if we were to switch to inference
+            if self.config.conv_kernel > 1:
+                # Cache the last k-1 tokens
+                new_conv_cache = x.transpose(1, 2)[:, :, -(self.config.conv_kernel-1):]
             else:
-                new_conv_cache = torch.empty(B, C, 0, device=x.device)
+                new_conv_cache = None
 
-        # --- 2. Projections ---
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
+        x_conv = F.silu(x_conv)
 
-        # --- STABILITY NORM ---
-        q = F.normalize(q, p=2, dim=-1) # L2 Norm for Matching
-        k = F.normalize(k, p=2, dim=-1) # L2 Norm for Matching
-        v = self.v_norm(v)              # LayerNorm for Accumulation Stability
+        # --- 2. Projections & Stability ---
+        # Normalize Q, K for stable matching (Cosine Attention style)
+        # Normalize V for stable accumulation
+        q = F.normalize(self.q_proj(x).view(B, T, self.num_heads, self.head_dim), p=2, dim=-1)
+        k = F.normalize(self.k_proj(x).view(B, T, self.num_heads, self.head_dim), p=2, dim=-1)
+        v = self.v_norm(self.v_proj(x).view(B, T, self.num_heads, self.head_dim))
 
         # --- 3. Gating ---
-        input_gate = F.sigmoid(self.input_gate_proj(x_conv)).view(B, T, self.num_heads, self.head_dim)
-        gamma = F.sigmoid(self.gamma_proj(x_conv)).view(B, T, self.num_heads, 1)
+        i_gate = torch.sigmoid(self.input_gate_proj(x_conv)).view(B, T, self.num_heads, self.head_dim)
+        gamma = torch.sigmoid(self.gamma_proj(x_conv)).view(B, T, self.num_heads, 1)
 
-        # --- 4. Scan ---
+        # --- 4. Scan Logic (SSM Core) ---
         if rnn_state is None:
-            mem = chunked_parallel_scan(k, v, input_gate, gamma)
-            next_rnn_state = mem[:, -1].detach().clone() 
+            # Parallel training
+            mem = chunked_parallel_scan(k, v, i_gate, gamma)
+            # Save the final state for potential continuation
+            next_rnn_state = mem[:, -1].detach().clone()
         else:
-            mem, next_rnn_state = recurrent_scan(k, v, input_gate, gamma, rnn_state)
+            # Step-by-step inference
+            mem, next_rnn_state = recurrent_scan(k, v, i_gate, gamma, rnn_state)
 
-        # --- 5. Output ---
-        mem_flat = mem.reshape(B * T, self.d_model) 
-        mem_norm = self.mem_norm(mem_flat)
-        mem = mem_norm.view(B, T, self.num_heads, self.head_dim)
-
-        out = (mem * q).reshape(B, T, C)
-
-        out_flat = out.reshape(B * T, C)
-        out_norm = self.grp_norm(out_flat)
-        out = out_norm.view(B, T, C)
+        # --- 5. Output Projection & Gating ---
+        # Normalize memory state before combining with Query
+        mem_out = self.mem_norm(mem)
         
-        output_gate = F.sigmoid(self.output_gate_proj(x_conv))
-        out = out * output_gate
+        # Attention: Q * Memory
+        out = (mem_out * q).reshape(B, T, C)
         
-        next_state = (next_rnn_state, new_conv_cache)
+        # GroupNorm on the combined output
+        out = self.grp_norm(out.reshape(B*T, C)).view(B, T, C)
         
-        return self.o_proj(out), next_state
+        # Output gating
+        out = out * torch.sigmoid(self.output_gate_proj(x_conv))
+        
+        return self.o_proj(out), (next_rnn_state, new_conv_cache)
 
 
-# --- UPDATED: PURE SWIGLU MLP ---
-# Removed: Time Mixing / Token Shifting
-# Result: Standard Gated MLP (LLaMA style)
 class LongMLP(nn.Module):
-    def __init__(self, config: LongConfig):
+    def __init__(self, config):
         super().__init__()
-        self.d_model = config.hidden_size
-        self.intermediate = config.intermediate_size
+        # Standard SwiGLU Projections
+        # Using config.intermediate_size is the standard HF naming convention
+        self.w_gate = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.w_val  = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.w_out  = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
-        # SwiGLU projections: Gate, Value, Output
-        self.w_gate = nn.Linear(self.d_model, self.intermediate, bias=False)
-        self.w_val  = nn.Linear(self.d_model, self.intermediate, bias=False)
-        self.w_out  = nn.Linear(self.intermediate, self.d_model, bias=False)
-        
-    def forward(self, x, state = None):
+    def forward(self, x, state=None):
         """
-        Forward pass for SwiGLU MLP.
+        Standard Position-wise Feed Forward with SwiGLU.
         Args:
-            x: Input tensor [Batch, Time, Dim]
-            state: Ignored (kept for compatibility with Block signature)
+            x: Input tensor [Batch, Time, Hidden]
+            state: Ignored (kept for compatibility with Block loop)
         """
-        # 1. Gate calculation (SiLU activation)
-        gate = F.silu(self.w_gate(x))
+        # SwiGLU Logic: Output = W_out ( SiLU(W_gate(x)) * W_val(x) )
         
-        # 2. Value calculation (Linear)
+        gate = F.silu(self.w_gate(x))
         val = self.w_val(x)
         
-        # 3. Element-wise multiplication (Gating) -> Output projection
+        # Element-wise multiplication of the gated path and value path
         out = self.w_out(gate * val)
         
-        # We return None as state because this MLP is now stateless
+        # Return None for the state, as this layer is stateless
         return out, None
 
 
@@ -238,6 +247,7 @@ class RoPESelfAttention(nn.Module):
         k = k_in.transpose(1, 2)
         v = v_in.transpose(1, 2)
         
+        # Standard Flash/Scaled Dot Product Attention
         out = F.scaled_dot_product_attention(
             q, k, v, 
             is_causal=True if state is None else False 
@@ -247,15 +257,17 @@ class RoPESelfAttention(nn.Module):
         return self.o_proj(out), next_state
 
 
+
 class LongBlock(nn.Module):
     def __init__(self, config: LongConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         
+        # Hybrid Attention Logic: Insert Standard Attention every 'ratio' layers
         self.is_anchor = (config.hybrid_ratio > 0) and ((layer_idx + 1) % config.hybrid_ratio == 0)
         
         if self.is_anchor:
-            self.attn = RoPESelfAttention(config) 
+            self.attn = RoPESelfAttention(config)
         else:
             self.attn = LongAttention(config)
 
@@ -276,21 +288,22 @@ class LongBlock(nn.Module):
         if past_key_value is not None:
             attn_state, mlp_state = past_key_value
 
+        # Attention Block
         residual = hidden_states
         hidden_states = self.ln1(hidden_states)
         
         attn_output, next_attn_state = self.attn(hidden_states, state=attn_state)
         hidden_states = residual + attn_output
 
+        # MLP Block
         residual = hidden_states
         hidden_states = self.ln2(hidden_states)
         
-        # NOTE: mlp_state will now be None since LongMLP is stateless
+        # Note: LongMLP is stateless, so next_mlp_state remains None
         mlp_output, next_mlp_state = self.mlp(hidden_states, state=mlp_state)
         hidden_states = residual + mlp_output
 
         if use_cache or past_key_value is not None:
-            # We still return a tuple, but the second element (MLP state) is None
             next_state = (next_attn_state, next_mlp_state)
         else:
             next_state = None
