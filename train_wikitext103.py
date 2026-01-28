@@ -156,6 +156,25 @@ if args.gradient_checkpointing:
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
+
+# --- CONDITIONAL COMPILATION ---
+# Only compile if model_type is 'long', otherwise run standard PyTorch
+if args.model_type == "long":
+    if accelerator.is_main_process:
+        console.print(f"[bold green][Performance] Model Type is '{args.model_type}'. Applying torch.compile()...[/bold green]")
+        
+    # Check if DeepSpeed/DDP has wrapped the model
+    if hasattr(model, "module"):
+        # IMPORTANT: Compile the INNER module to avoid RecursionError with DeepSpeed Engine
+        model.module = torch.compile(model.module, mode="default")
+    else:
+        # Fallback for single-GPU/non-DeepSpeed runs
+        model = torch.compile(model, mode="default")
+else:
+    if accelerator.is_main_process:
+        console.print(f"[dim][Performance] Model Type is '{args.model_type}'. Skipping torch.compile.[/dim]")
+
+
 # ===============================
 # 5. Load Data
 # ===============================
@@ -184,12 +203,6 @@ model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
 
-if args.model_type == "long":
-    if hasattr(model, "module"):
-        model.module = torch.compile(model.module, mode="default")
-    else:
-        model = torch.compile(model, mode="default")
-
 
 # --- LOAD STATE (Model + Optimizer + Scheduler) ---
 if args.resume_from_checkpoint:
@@ -206,7 +219,6 @@ loss_metric = MeanMetric().to(accelerator.device)
 # 7. Training Loop with Rich UI
 # ===============================
 model.train()
-
 # --- CORRECT DATA RESUMPTION LOGIC ---
 # We calculate how many "micro-batches" to skip.
 # Global Step = 1 Update.
@@ -270,7 +282,11 @@ try:
             if accelerator.sync_gradients:
                 # clip_grad_norm_ returns the norm before clipping
                 total_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                grad_norm_display = f"{total_norm.item():.2f}"
+
+                if isinstance(total_norm, torch.Tensor):
+                    grad_norm_display = f"{total_norm.item():.2f}"
+                else:
+                    grad_norm_display = f"{total_norm:.2f}"
             
             optimizer.step()
             scheduler.step()
