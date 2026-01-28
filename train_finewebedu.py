@@ -307,8 +307,8 @@ try:
             global_step += 1
             
             # GATHER OUTSIDE ACCUMULATE
-            gathered_loss = accelerator.gather(loss.detach())
-            loss_metric.update(gathered_loss.mean())
+            # gathered_loss = accelerator.gather(loss.detach())
+            # loss_metric.update(gathered_loss.mean())
             
             current_loss = loss_metric.compute().item()
             loss_metric.reset()
