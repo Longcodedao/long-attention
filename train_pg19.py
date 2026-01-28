@@ -22,7 +22,7 @@ from transformers import get_cosine_schedule_with_warmup
 from model import model_loader
 from dataset import data_loader
 import utils
-
+import torch.distributed as dist
 # Disable standard progress bars to let Rich handle the UI
 datasets.disable_progress_bar()
 datasets.utils.logging.set_verbosity_error()
@@ -193,6 +193,8 @@ val_loader = data_loader.get_dataloader(
     split="validation",
 )
 
+accelerator.print("Data Loaders initialized. Preparing for distributed training...")
+
 # ===============================
 # 6. Optimizer & Scheduler
 # ===============================
@@ -205,6 +207,11 @@ scheduler = get_cosine_schedule_with_warmup(
 model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
+
+# CRITICAL: Ensure all processes have finished 'preparing' before moving to state loading
+accelerator.wait_for_everyone()
+accelerator.print("Preparation complete. Moving to training loop.")
+
 
 
 # --- LOAD STATE (Model + Optimizer + Scheduler) ---

@@ -192,6 +192,8 @@ val_loader = data_loader.get_dataloader(
     split="validation",
 )
 
+accelerator.print("Data Loaders initialized. Preparing for distributed training...")
+
 # ===============================
 # 6. Optimizer & Scheduler
 # ===============================
@@ -204,6 +206,10 @@ scheduler = get_cosine_schedule_with_warmup(
 model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
+
+# CRITICAL: Ensure all processes have finished 'preparing' before moving to state loading
+accelerator.wait_for_everyone()
+accelerator.print("Preparation complete. Moving to training loop.")
 
 
 # --- LOAD STATE (Model + Optimizer + Scheduler) ---
@@ -419,5 +425,7 @@ except KeyboardInterrupt:
         live.stop()
         console.print("[bold red]Training Interrupted![/bold red]")
 
-if dist.is_initialized():
-    dist.destroy_process_group()
+finally:
+    accelerator.end_training()
+    if dist.is_initialized():
+        dist.destroy_process_group()

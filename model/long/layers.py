@@ -88,8 +88,17 @@ class LongAttention(nn.Module):
             x_t = x.transpose(1, 2).contiguous()
             # Concatenate history [old_cache, new_input]
             conv_window = torch.cat([conv_cache, x_t], dim=2)
-
             conv_window = conv_window.contiguous()
+
+            # === FIX: Handle Short Context / Warmup ===
+            # If (Cache + Input) < Kernel Size, we must pad left to run the convolution
+            # This happens when processing the very first few tokens of a generation
+            window_len = conv_window.shape[-1]
+            if window_len < self.config.conv_kernel:
+                pad_amt = self.config.conv_kernel - window_len
+                # Pad left (zeros) to reach kernel size
+                conv_window = F.pad(conv_window, (pad_amt, 0)).contiguous()
+            
             # Apply convolution
             # We take the last T steps of the valid output
             # x_conv = self.conv(conv_window)[:, :, :T].transpose(1, 2).contiguous()
@@ -181,7 +190,6 @@ class LongAttention(nn.Module):
         out = out * torch.sigmoid(self.output_gate_proj(x_conv))
         
         return self.o_proj(out), (next_rnn_state, new_conv_cache)
-
 
 class LongMLP(nn.Module):
     def __init__(self, config):
