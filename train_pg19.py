@@ -2,104 +2,152 @@ import sys
 import os
 import math
 import torch
-from transformers import get_cosine_schedule_with_warmup
+import random
 import argparse
+import datasets
+import transformers
+import warnings
+import torch.nn.functional as F
+import torch.distributed as dist
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torchmetrics import MeanMetric
 from rich.live import Live
 from rich.panel import Panel
 from rich.console import Group
-import torch.nn.functional as F
+from rich.table import Table
+from transformers import get_cosine_schedule_with_warmup
 
 # --- LOCAL IMPORTS ---
 from model import model_loader
 from dataset import data_loader
 import utils
-import datasets
-import transformers
-import warnings
 
-# Optimization for PG19
+# Disable standard progress bars to let Rich handle the UI
 datasets.disable_progress_bar()
+datasets.utils.logging.set_verbosity_error()
+transformers.utils.logging.set_verbosity_error()
 warnings.filterwarnings("ignore", message=".*barrier().*")
 
-def log_sample_generation(model, tokenizer, accelerator, global_step, prompt="The mysterious book began with"):
+# ===============================
+# 0. Monitoring Strategy: Evaluation Prompts
+# ===============================
+EVAL_PROMPTS = [
+    "The mysterious book began with",
+    "It was the best of times, it was",
+    "The history of the empire is",
+    "She walked into the dark room and",
+    "In the early 19th century, the philosophy",
+    "The captain looked out at the sea and",
+    "To understand the nature of reality, one must"
+]
+
+def log_sample_generation(model, tokenizer, accelerator, global_step):
+    """
+    Picks a random prompt, generates text, and logs it to Console + TensorBoard.
+    """
     model.eval()
+    
+    prompt = random.choice(EVAL_PROMPTS)
+    
     device = next(model.parameters()).device
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
+    generated_text = ""
     try:
         with torch.no_grad():
             output_ids = model.generate(
                 input_ids, 
-                max_new_tokens=128, # Books need more tokens to show coherence
-                do_sample=True,
-                temperature=0.8,
-                top_k=40,
-                repetition_penalty=1.1,
+                max_new_tokens=128,        
+                do_sample=True,          
+                temperature=0.8,         
+                top_k=40,                
+                repetition_penalty=1.1,  
                 pad_token_id=tokenizer.eos_token_id
             )
         generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        
     except Exception as e:
-        generated_text = f"Generation failed: {e}"
+        generated_text = f"[Generation Error]: {e}"
 
     model.train()
+
     if accelerator.is_main_process:
-        # Log to TensorBoard
         tracker = accelerator.get_tracker("tensorboard")
         if tracker:
-            tracker.writer.add_text("Samples/PG19", f"**Step {global_step}**\n\n{generated_text}", global_step)
-        # Print to console above the Live display
-        print(f"\n[Step {global_step}] Sample: {generated_text[:200]}...\n")
+            tracker.writer.add_text("Samples/PG19", f"**Step {global_step}**\n\n**Prompt:** {prompt}\n\n{generated_text}", global_step)
+            
+    return prompt, generated_text
 
+# ===============================
+# 1. Argument Parsing
+# ===============================
 def parse_args():
     parser = argparse.ArgumentParser(description="LLM Training Script - PG19")
-    parser.add_argument("--dataset", type=str, default="pg19")
-    parser.add_argument("--val_dataset", type=str, default="pg19")
-    parser.add_argument("--model_type", type=str, default="long", choices=["holo", "gpt2", "mamba", "mamba2", "long"])
-    parser.add_argument("--model_size", type=str, default="small")
+    parser.add_argument("--dataset", type=str, default="pg19", help="dataset name")
+    parser.add_argument("--val_dataset", type=str, default="pg19", help="validation dataset name")
+    parser.add_argument("--model_type", type=str, default="long", choices=["holo", "gpt2", "mamba", "mamba2", "long"], help="Model architecture")
+    parser.add_argument("--model_size", type=str, default="small", help="Model size")
     
     # PG19 specific hyperparams
-    parser.add_argument("--batch_size", type=int, default=4) # Reduced for longer seq_len
-    parser.add_argument("--grad_accum_steps", type=int, default=8) 
-    parser.add_argument("--lr", type=float, default=2e-4) # Lower LR for stability on large data
-    parser.add_argument("--max_steps", type=int, default=50000)
-    parser.add_argument("--seq_len", type=int, default=2048) # PG19 standard is 2048+
-    parser.add_argument("--warmup_steps", type=int, default=2000)
-    parser.add_argument("--save_steps", type=int, default=2500)
-    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument("--batch_size", type=int, default=4, help="Per-device batch size (Reduced for longer seq_len)")
+    parser.add_argument("--grad_accum_steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--max_steps", type=int, default=50000, help="Total training steps")
+    parser.add_argument("--seq_len", type=int, default=2048, help="PG19 standard is 2048+")
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="Warmup steps")
+    parser.add_argument("--save_steps", type=int, default=2500, help="Save checkpoint every X steps")
+    parser.add_argument("--eval_steps", type=int, default=500, help="Evaluate every X steps")
 
-    parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/pg19_long")
-    parser.add_argument("--output_dir", type=str, default="./output/pg19_long")
-    parser.add_argument("--log_dir", type=str, default="./logs/pg19")
+    # System
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="Save VRAM")      
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to checkpoint or 'latest'")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/pg19_long", help="Save directory")
+    parser.add_argument("--output_dir", type=str, default="./output/pg19_long", help="Final model directory")
+    parser.add_argument("--log_dir", type=str, default="./logs/pg19", help="TensorBoard log directory")
     
     return parser.parse_args()
 
-def evaluate(model, val_loader, max_eval_batches=30):
-    model.eval()
-    losses = []
-    val_iter = iter(val_loader)
-    with torch.no_grad():
-        for _ in range(max_eval_batches):
-            try:
-                batch = next(val_iter)
-            except StopIteration:
-                break
-            outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
-            losses.append(accelerator.gather(outputs.loss).mean().item())
-    model.train()
-    return sum(losses) / len(losses) if losses else float("inf")
-
-# --- MAIN EXECUTION ---
 args = parse_args()
-accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum_steps, log_with="tensorboard", project_dir=".")
+
+# ===============================
+# 2. Setup Accelerator
+# ===============================
+accelerator = Accelerator(
+    gradient_accumulation_steps=args.grad_accum_steps,
+    log_with="tensorboard",
+    project_dir="."
+)
 set_seed(42)
 console = utils.get_console(accelerator)
 
-# Load Model
+if accelerator.is_main_process:
+    utils.print_config_table(console, accelerator, args)
+    
+
+# ===============================
+# 3. Handle Resume Logic (Determine Step)
+# ===============================
+resume_step = 0
+if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint == "latest":
+        if os.path.exists(args.checkpoint_dir):
+            folders = [f for f in os.listdir(args.checkpoint_dir) if "step_" in f]
+            if folders:
+                folders.sort(key=lambda x: int(x.split("_")[1]))
+                args.resume_from_checkpoint = os.path.join(args.checkpoint_dir, folders[-1])
+                resume_step = int(folders[-1].split("_")[1])
+    else:
+        try:
+            # defined as the last part of the path (e.g. "step_5000")
+            step_str = os.path.basename(os.path.normpath(args.resume_from_checkpoint))
+            resume_step = int(step_str.split("_")[-1])
+        except:
+            resume_step = 0 
+
+# ===============================
+# 4. Load Model & Tokenizer
+# ===============================
 model, tokenizer = model_loader.get_model_and_tokenizer(
     model_type=args.model_type,
     model_size=args.model_size,
@@ -109,143 +157,268 @@ model, tokenizer = model_loader.get_model_and_tokenizer(
 
 if args.gradient_checkpointing:
     model.gradient_checkpointing_enable()
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
 
-# Load Data
-train_loader = data_loader.get_dataloader(console,
-                                          accelerator, 
-                                          tokenizer,
-                                          args.dataset, 
-                                          args.batch_size, 
-                                          args.seq_len, 
-                                          split="train")
-val_loader = data_loader.get_dataloader(console, accelerator, tokenizer, args.val_dataset, args.batch_size, args.seq_len, split="validation")
+# --- CONDITIONAL COMPILATION ---
+# Only compile if model_type is 'long', otherwise run standard PyTorch
+if args.model_type == "long":
+    if accelerator.is_main_process:
+        console.print(f"[bold green][Performance] Model Type is '{args.model_type}'. Applying torch.compile()...[/bold green]")
+        
+    # Check if DeepSpeed/DDP has wrapped the model
+    if hasattr(model, "module"):
+        # IMPORTANT: Compile the INNER module to avoid RecursionError with DeepSpeed Engine
+        model.module = torch.compile(model.module, mode="default")
+    else:
+        # Fallback for single-GPU/non-DeepSpeed runs
+        model = torch.compile(model, mode="default")
+else:
+    if accelerator.is_main_process:
+        console.print(f"[dim][Performance] Model Type is '{args.model_type}'. Skipping torch.compile.[/dim]")
 
+
+# ===============================
+# 5. Load Data
+# ===============================
+# Note: Relies on Accelerator's native skipping, no fast_skip_batches arg
+train_loader = data_loader.get_dataloader(
+    console, accelerator, tokenizer, 
+    args.dataset, args.batch_size, args.seq_len, 
+    split="train"
+)
+val_loader = data_loader.get_dataloader(
+    console, accelerator, tokenizer, 
+    args.val_dataset, args.batch_size, args.seq_len, 
+    split="validation",
+)
+
+# ===============================
+# 6. Optimizer & Scheduler
+# ===============================
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
-scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps)
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
+)
 
-model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
+# Prepare everything with Accelerator
+model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+    model, optimizer, train_loader, val_loader, scheduler
+)
+
+
+# --- LOAD STATE (Model + Optimizer + Scheduler) ---
+if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint != "latest" or os.path.exists(args.checkpoint_dir):
+        if accelerator.is_main_process:
+            console.print(f"[bold yellow]Loading state from {args.resume_from_checkpoint}...[/bold yellow]")
+        accelerator.load_state(args.resume_from_checkpoint)
+        if accelerator.is_main_process:
+            console.print("[green]State loaded successfully (Weights, Opt, Sched).[/green]")
+
 loss_metric = MeanMetric().to(accelerator.device)
 
-# Resume logic 
-global_step = 0
-batches_to_skip = 0
+# ===============================
+# 7. Training Loop with Rich UI
+# ===============================
+model.train()
+# --- CORRECT DATA RESUMPTION LOGIC ---
+# We calculate how many "micro-batches" to skip.
+# Global Step = 1 Update.
+# 1 Update = (Gradient Accumulation) Batches.
+batches_to_skip = resume_step * args.grad_accum_steps
 
-if args.resume_from_checkpoint:
-    if args.resume_from_checkpoint != "":
-        accelerator.print(f"Resuming training from: {args.resume_from_checkpoint}")
-        
-        # 1. Load Model, Optimizer, and Scheduler states
-        accelerator.load_state(args.resume_from_checkpoint)
-        
-        # 2. Extract global_step from the folder name (assuming format ends in '/step_X')
-        try:
-            # defined as the last part of the path (e.g. "step_5000")
-            step_str = os.path.basename(os.path.normpath(args.resume_from_checkpoint))
-            global_step = int(step_str.split("_")[-1])
-        except ValueError:
-            accelerator.print("Warning: Could not parse global step from checkpoint path. Starting step count at 0.")
+if resume_step > 0:
+    if accelerator.is_main_process:
+        console.print(f"[bold yellow]Resuming Data: Skipping {batches_to_skip} micro-batches to match Step {resume_step}...[/bold yellow]")
+    
+    # This acts as a "Fast Forward" for the data loader using the official method
+    # It ensures the data iterator starts exactly where the model left off
+    active_dataloader = accelerator.skip_first_batches(train_loader, batches_to_skip)
+else:
+    active_dataloader = train_loader
 
-        # 3. Skip the batches we have already trained on
-        #    Total batches = global_step * grad_accum_steps
-        batches_to_skip = global_step * args.grad_accum_steps
-        # train_loader = accelerator.skip_first_batches(train_loader, num_batches=initial_batches_to_skip)
-        
-        accelerator.print(f"  -> Resuming at Global Step {global_step}")
-        accelerator.print(f"  -> Will fast-forward {batches_to_skip} batches in Data Loader.")
-train_loader = data_loader.get_dataloader(console,
-                                          accelerator, 
-                                          tokenizer,
-                                          args.dataset, 
-                                          args.batch_size, 
-                                          args.seq_len, 
-                                          split="train",
-                                          fast_skip_batches = batches_to_skip)
+# Create the iterator from the fast-forwarded loader
+data_iter = iter(active_dataloader)
 
-train_loader = accelerator.prepare(train_loader)
-data_iter = iter(train_loader)
+# UI Variables
+gen_text_display = "Waiting for first evaluation..."
+gen_prompt_display = "None"
+val_loss_display = "N/A"
+grad_norm_display = "0.0"
 
-# UI Setup
 progress_bar = utils.create_progress_bar()
-val_message = "[dim]Waiting for PG19 evaluation...[/dim]"
-val_border_style = "dim"
-last_eval_step = 0
 
 if accelerator.is_main_process:
-    accelerator.init_trackers(args.log_dir, config=vars(args))
-    train_task_id = progress_bar.add_task("[cyan]PG19 Training", total=args.max_steps)
-    live = Live(console=console, refresh_per_second=2, redirect_stdout=True)
+    accelerator.init_trackers(os.path.basename(args.log_dir), config=vars(args))
+    train_task_id = progress_bar.add_task("[green]PG19 Training...", total=args.max_steps)
+    
+    # Check Scheduler State (Sanity Check)
+    current_lr = scheduler.get_last_lr()[0]
+    console.print(f"[bold cyan]Resumed Scheduler LR: {current_lr:.2e}[/bold cyan]")
+    
+    live = Live(console=console, refresh_per_second=4) 
     live.start()
+
+global_step = resume_step
 
 try:
     while global_step < args.max_steps:
+        # --- Data Fetching ---
         try:
             batch = next(data_iter)
         except StopIteration:
+            # If we run out of data, reset to the beginning (epoch done)
+            if accelerator.is_main_process:
+                # console.print("[dim]Epoch Complete. Restarting Data Loader...[/dim]") # Optional log
+                pass
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
+        # --- Forward / Backward ---
         with accelerator.accumulate(model):
             outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
-            accelerator.backward(outputs.loss)
+            loss = outputs.loss
+            accelerator.backward(loss)
             
+            # Clip Gradients & Log Norm (Crucial for stability)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                # clip_grad_norm_ returns the norm before clipping
+                total_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+                if isinstance(total_norm, torch.Tensor):
+                    grad_norm_display = f"{total_norm.item():.2f}"
+                else:
+                    grad_norm_display = f"{total_norm:.2f}"
             
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             
-            loss_metric.update(accelerator.gather(outputs.loss.detach()).mean())
+            gathered_loss = accelerator.gather(loss.detach())
+            loss_metric.update(gathered_loss.mean())
 
+        # --- Step Updates ---
         if accelerator.sync_gradients:
             global_step += 1
-            curr_loss = loss_metric.compute().item()
-            curr_ppl = math.exp(curr_loss) if curr_loss < 20 else float("inf")
-            
+            current_loss = loss_metric.compute().item()
+            loss_metric.reset()
+            current_ppl = math.exp(current_loss) if current_loss < 20 else 9999.0
+            current_lr = scheduler.get_last_lr()[0]
+
             if accelerator.is_main_process:
                 progress_bar.update(train_task_id, completed=global_step)
-                metrics_panel = utils.create_metrics_table(global_step, args.max_steps, curr_loss, curr_ppl, scheduler.get_last_lr()[0])
-                val_panel = Panel(val_message, title="Eval Status", border_style=val_border_style, width=60)
-                live.update(Group(metrics_panel, val_panel, progress_bar))
-
-            accelerator.log({"train_loss": curr_loss, "train_ppl": curr_ppl}, step=global_step)
-
-            if global_step % args.eval_steps == 0:
-                val_loss = evaluate(model, val_loader)
-                val_ppl = math.exp(val_loss) if val_loss < 20 else float("inf")
-                last_eval_step = global_step
                 
+                # --- UI Construction ---
+                metrics_table = Table(show_header=False, box=None)
+                metrics_table.add_row("Loss", f"[bold red]{current_loss:.4f}[/bold red]")
+                metrics_table.add_row("PPL", f"[yellow]{current_ppl:.2f}[/yellow]")
+                metrics_table.add_row("LR", f"{current_lr:.2e}")
+                metrics_table.add_row("Grad Norm", f"{grad_norm_display}")
+                
+                status_panel = Panel(
+                    metrics_table, 
+                    title=f"Step {global_step}/{args.max_steps}", 
+                    border_style="green",
+                    width=30
+                )
+                
+                gen_panel = Panel(
+                    f"[dim]Prompt:[/dim] [cyan]{gen_prompt_display}[/cyan]\n\n{gen_text_display}",
+                    title=f"Last Generation (Val Loss: {val_loss_display})",
+                    border_style="blue",
+                    height=12
+                )
+                
+                live.update(Group(
+                    Panel(progress_bar, border_style="none"),
+                    transformers.utils.logging.get_logger("transformers").level == 40 and "" or "", # spacer
+                    status_panel,
+                    gen_panel
+                ))
+
+            # Log to TensorBoard
+            accelerator.log({
+                "train_loss": current_loss, 
+                "train_ppl": current_ppl, 
+                "lr": current_lr,
+                "grad_norm": float(grad_norm_display) 
+            }, step=global_step)
+            
+            # --- EVALUATION ---
+            if global_step % args.eval_steps == 0:
+                # 1. Calculate Val Loss
+                model.eval()
+                val_losses = []
+                # Limit eval to 30 batches for speed
+                val_iter = iter(val_loader)
+                for _ in range(30):
+                    try:
+                        vbatch = next(val_iter)
+                    except StopIteration:
+                        break
+                    with torch.no_grad():
+                        v_out = model(input_ids=vbatch["input_ids"], labels=vbatch["input_ids"])
+                        val_losses.append(accelerator.gather(v_out.loss).mean().item())
+                
+                avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("inf")
+                val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 9999.0
+                
+                val_loss_display = f"{avg_val_loss:.4f}"
+                accelerator.log({"val_loss": avg_val_loss, "val_ppl": val_ppl}, step=global_step)
+                model.train()
+
+                # 2. Generate Sample (Main Process Only)
                 if accelerator.is_main_process:
-                    log_sample_generation(model, tokenizer, accelerator, global_step)
-                    val_message = f"[bold green]Step {last_eval_step}[/bold green]\nLoss: {val_loss:.4f} | PPL: {val_ppl:.2f}"
-                    val_border_style = "green"
+                    prompt_used, sample_text = log_sample_generation(model, tokenizer, accelerator, global_step)
+                    # Update UI variables
+                    gen_prompt_display = prompt_used
+                    gen_text_display = f"[white]{sample_text[:300]}...[/white]"
 
-                accelerator.log({"val_loss": val_loss, "val_ppl": val_ppl}, step=global_step)
-
+            # --- SAVE ---
             if global_step % args.save_steps == 0:
                 accelerator.wait_for_everyone()
                 accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
 
-    # --- SAVE FINAL MODEL (ADDED) ---
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        console.print(f"\n[bold cyan]Training Finished! Saving final model to {args.output_dir}...[/bold cyan]")
-        
-        # Unwrap the model to remove accelerator/DDP wrappers
-        unwrapped_model = accelerator.unwrap_model(model)
-        
-        # Save model and tokenizer in Hugging Face format
-        unwrapped_model.save_pretrained(
-            args.output_dir, 
-            is_main_process=accelerator.is_main_process, 
-            save_function=accelerator.save
-        )
-        if tokenizer:
-            tokenizer.save_pretrained(args.output_dir)
-            
-        console.print(f"[bold green]✓ Model saved successfully to {args.output_dir}[/bold green]")
-
-finally:
+    # --- FINALIZE ---
     if accelerator.is_main_process:
         live.stop()
+        console.print("[bold green]Training Complete! Saving final model...[/bold green]")
+
+    accelerator.wait_for_everyone()
+
+    # === FIX: Manual Unwrapping to bypass Accelerate/torch.compile crash ===
+    # This robust unwrap logic ensures we don't save the compiled container
+    unwrapped_model = model
+    
+    # 1. Unwrap DeepSpeed/DDP (recursively get .module)
+    while hasattr(unwrapped_model, "module"):
+        unwrapped_model = unwrapped_model.module
+        
+    # 2. Unwrap torch.compile (look for _orig_mod)
+    # Accelerate crashes here because it assumes _orig_mod is always in __dict__,
+    # but a simple getattr/hasattr check is much safer.
+    if hasattr(unwrapped_model, "_orig_mod"):
+        unwrapped_model = unwrapped_model._orig_mod
+
+    # 3. Save
+    unwrapped_model.save_pretrained(
+        args.output_dir, 
+        save_function=accelerator.save, 
+        safe_serialization=False
+    )
+    if tokenizer:
+        tokenizer.save_pretrained(args.output_dir)
+        
+    if accelerator.is_main_process:
+        console.print(f"[bold green]Model saved to {args.output_dir}[/bold green]")
+
+except KeyboardInterrupt:
+    if accelerator.is_main_process:
+        live.stop()
+        console.print("[bold red]Training Interrupted![/bold red]")
+
+finally:
     accelerator.end_training()
+    if dist.is_initialized():
+        dist.destroy_process_group()

@@ -26,13 +26,9 @@ def load_data_source(name, split):
         return load_dataset("emozilla/pg19", split=split, streaming=True)
         
     elif name == "fineweb-edu":
-        print(f"[Dataset] Loading FineWeb-Edu (10BT) and simulating '{split}' split...")
-        
-        # 1. Always load the base 'train' set
+        # ... (Same as before) ...
         ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-
         val_size = 5000 
-
         if split == "validation":
             return ds.take(val_size)
         else:
@@ -43,20 +39,17 @@ def load_data_source(name, split):
     else:
         raise ValueError(f"Unknown dataset or path: {name}")
 
-        
-
+# --- REMOVED fast_skip_batches from arguments ---
 def _packed_generator_func(raw_dataset, tokenizer_encode_func, eos_id, seq_len, 
-
-                           batch_size, fast_skip_batches, dataset_name, 
+                           batch_size, dataset_name, 
                            num_processes, process_index, is_sharded, is_main_process):
     
     buffer = []
-    skipped_counter = 0 
+    # Removed: skipped_counter = 0 
     is_massive_doc_dataset = (dataset_name == "pg19")
     
     iterator = iter(raw_dataset)
 
-    # Manual process sharding if file-level sharding failed
     if not is_sharded and num_processes > 1:
         iterator = itertools.islice(iterator, process_index, None, num_processes)
 
@@ -65,63 +58,45 @@ def _packed_generator_func(raw_dataset, tokenizer_encode_func, eos_id, seq_len,
         if not text or len(text.strip()) < 2: 
             continue
 
-        # --- TOKENIZATION & EOS APPENDING ---
+        # --- TOKENIZATION ---
         if is_massive_doc_dataset:
-            # For massive documents (PG19), we chunk the text BEFORE tokenizing to save RAM
             chunk_char_size = 100_000 
             for i in range(0, len(text), chunk_char_size):
                 text_chunk = text[i : i + chunk_char_size]
                 tokens = tokenizer_encode_func(text_chunk, add_special_tokens=False)
                 
-                # If this is the LAST chunk of a massive document, append EOS
                 if i + chunk_char_size >= len(text):
                     tokens.append(eos_id)
                 
                 buffer.extend(tokens)
                 
-                # Process buffer immediately if it overflows seq_len
                 while len(buffer) >= seq_len:
-                    if skipped_counter < fast_skip_batches:
-                        buffer = buffer[seq_len:]
-                        skipped_counter += 1
-                        if skipped_counter % 1000 == 0 and is_main_process:
-                            print(f"[Resuming] Skipped {skipped_counter}/{fast_skip_batches} batches...", end="\r", flush=True)
-                        continue
-
+                    # --- REMOVED MANUAL SKIPPING LOGIC HERE ---
                     chunk = buffer[:seq_len]
                     input_ids = torch.tensor(chunk, dtype=torch.long)
                     yield {"input_ids": input_ids, "labels": input_ids.clone()}
                     buffer = buffer[seq_len:]
         else:
-            # Standard Strategy: Tokenize document, append EOS, then add to buffer
             tokens = tokenizer_encode_func(text, add_special_tokens=False)
             tokens.append(eos_id)
             buffer.extend(tokens)
             
             while len(buffer) >= seq_len:
-                if skipped_counter < fast_skip_batches:
-                    buffer = buffer[seq_len:]
-                    skipped_counter += 1
-                    if skipped_counter % 1000 == 0 and is_main_process:
-                        print(f"[Resuming] Skipped {skipped_counter}/{fast_skip_batches} batches...", end="\r", flush=True)
-                    continue
-
+                # --- REMOVED MANUAL SKIPPING LOGIC HERE ---
                 chunk = buffer[:seq_len]
                 input_ids = torch.tensor(chunk, dtype=torch.long)
                 yield {"input_ids": input_ids, "labels": input_ids.clone()}
                 buffer = buffer[seq_len:]
 
+# --- REMOVED fast_skip_batches arg ---
 def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size, 
-                   seq_len=2048, split="train", num_workers=0, fast_skip_batches=0):
+                   seq_len=2048, split="train", num_workers=0):
     
     if accelerator.is_main_process:
         console.print(f"[Dataset] Loading '{dataset_name}' (Split: {split}) with PACKING...")
-        if fast_skip_batches > 0:
-            console.print(f"[Dataset] Fast-forwarding: Skipping first {fast_skip_batches} batches.")
 
     raw_dataset = load_data_source(dataset_name, split)
 
-    # Sharding Logic
     is_sharded = False
     try:
         if accelerator.num_processes > 1:
@@ -132,22 +107,20 @@ def get_dataloader(console, accelerator, tokenizer, dataset_name, batch_size,
             console.print(f"[Warning] Sharding failed ({e}). Using manual fallback.")
         is_sharded = False
 
-    # Shuffle for training
     if split == "train":
         raw_dataset = raw_dataset.shuffle(seed=42, buffer_size=10_000)
 
-    # Resolve EOS ID
     eos_id = tokenizer.eos_token_id
     if eos_id is None:
         eos_id = getattr(tokenizer, "pad_token_id", 0)
             
+    # Removed fast_skip_batches from kwargs
     gen_kwargs = {
         "raw_dataset": raw_dataset,
         "tokenizer_encode_func": tokenizer.encode,
         "eos_id": eos_id,
         "seq_len": seq_len,
         "batch_size": batch_size,
-        "fast_skip_batches": fast_skip_batches,
         "dataset_name": dataset_name,
         "num_processes": accelerator.num_processes,
         "process_index": accelerator.process_index,

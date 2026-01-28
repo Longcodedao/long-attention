@@ -109,6 +109,7 @@ def parse_args():
 
 args = parse_args()
 
+
 # ===============================
 # 2. Setup Accelerator
 # ===============================
@@ -122,6 +123,7 @@ console = utils.get_console(accelerator)
 
 if accelerator.is_main_process:
     utils.print_config_table(console, accelerator, args)
+    
 
 # ===============================
 # 3. Handle Resume Logic (Determine Step)
@@ -375,17 +377,47 @@ try:
     if accelerator.is_main_process:
         live.stop()
         console.print("[bold green]Training Complete! Saving final model...[/bold green]")
-        
+
     accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.save_pretrained(
-        args.output_dir, 
-        save_function=accelerator.save,
-        safe_serialization=False
-     )
-    tokenizer.save_pretrained(args.output_dir)
+
+    if accelerator.is_main_process:
+        live.stop()
+        console.print("[bold green]Training Complete! Saving final model...[/bold green]")
+
+        # === FIX: Manual Unwrapping to bypass Accelerate/torch.compile crash ===
+        unwrapped_model = model
+        
+        # 1. Unwrap DeepSpeed/DDP (recursively get .module)
+        while hasattr(unwrapped_model, "module"):
+            unwrapped_model = unwrapped_model.module
+            
+        # 2. Unwrap torch.compile (look for _orig_mod)
+        # Accelerate crashes here because it assumes _orig_mod is always in __dict__,
+        # but a simple getattr/hasattr check is much safer.
+        if hasattr(unwrapped_model, "_orig_mod"):
+            unwrapped_model = unwrapped_model._orig_mod
+
+        # 3. Save
+        unwrapped_model.save_pretrained(
+            args.output_dir, 
+            save_function=accelerator.save, 
+            safe_serialization=False
+        )
+        tokenizer.save_pretrained(args.output_dir)
+        console.print(f"[bold green]Model saved to {args.output_dir}[/bold green]")
+        
+    # unwrapped_model = accelerator.unwrap_model(model)
+    # unwrapped_model.save_pretrained(
+    #     args.output_dir, 
+    #     save_function=accelerator.save,
+    #     safe_serialization=False
+    #  )
+    # tokenizer.save_pretrained(args.output_dir)
 
 except KeyboardInterrupt:
     if accelerator.is_main_process:
         live.stop()
         console.print("[bold red]Training Interrupted![/bold red]")
+
+if dist.is_initialized():
+    dist.destroy_process_group()
