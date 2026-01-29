@@ -247,7 +247,7 @@ else:
     active_dataloader = train_loader
 
 
-data_iter = iter(train_loader)
+data_iter = iter(active_dataloader)
 
 # UI State
 gen_text_display = "Waiting for first evaluation..."
