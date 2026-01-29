@@ -18,6 +18,7 @@ class LongConfig(PretrainedConfig):
         tie_word_embeddings=True,
         gate_init_bias=-3.0,
         use_cache=True,
+        rope_base_dim = 10000,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -33,6 +34,7 @@ class LongConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.gate_init_bias = gate_init_bias
         self.use_cache = use_cache
+        self.rope_base_dim = rope_base_dim
         
         # --- GPU-Efficient Intermediate Size Calculation ---
         # 1. Calculate raw size: 768 * (8/3) = 2048

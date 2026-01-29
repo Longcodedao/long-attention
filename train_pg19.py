@@ -43,42 +43,44 @@ EVAL_PROMPTS = [
 ]
 
 def log_sample_generation(model, tokenizer, accelerator, global_step):
-    """
-    Picks a random prompt, generates text, and logs it to Console + TensorBoard.
-    """
-    model.eval()
+    # Manual wrapping 
+    unwrapped_model = model
+    while hasattr(unwrapped_model, "module"):
+        unwrapped_model = unwrapped_model.module
+        
+    # Unwrap torch.compile wrapper (safe check)
+    if hasattr(unwrapped_model, "_orig_mod"):
+        unwrapped_model = unwrapped_model._orig_mod
     
     prompt = random.choice(EVAL_PROMPTS)
-    
-    device = next(model.parameters()).device
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    generated_text = "" 
 
-    generated_text = ""
-    try:
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids, 
-                max_new_tokens=128,        
-                do_sample=True,          
-                temperature=0.8,         
-                top_k=40,                
-                repetition_penalty=1.1,  
-                pad_token_id=tokenizer.eos_token_id
-            )
-        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        
-    except Exception as e:
-        generated_text = f"[Generation Error]: {e}"
-
-    model.train()
-
+    # ONLY GPU 0 does the risky work
     if accelerator.is_main_process:
-        tracker = accelerator.get_tracker("tensorboard")
-        if tracker:
-            tracker.writer.add_text("Samples/PG19", f"**Step {global_step}**\n\n**Prompt:** {prompt}\n\n{generated_text}", global_step)
-            
-    return prompt, generated_text
+        try:
+            with torch.no_grad():
+                input_ids = tokenizer.encode(prompt, return_tensors="pt").to(accelerator.device)
+                output_ids = unwrapped_model.generate(
+                    input_ids, 
+                    max_new_tokens=128,
+                    do_sample=True,
+                    temperature=0.8,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+                generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                
+                # Log to TensorBoard immediately while on main process
+                tracker = accelerator.get_tracker("tensorboard")
+                if tracker:
+                    tracker.writer.add_text("Samples/PG19", 
+                                            f"**Step {global_step}**\n\n**Prompt:** {prompt}\n\n{generated_text}", global_step)
+        except Exception as e:
+            generated_text = f"Generation failed: {e}"
+            print(f"Gen Error: {e}")
 
+    # Return to the main loop (GPU 1 will return "", GPU 0 will return the text)
+    return prompt, generated_text
+    
 # ===============================
 # 1. Argument Parsing
 # ===============================
@@ -160,22 +162,6 @@ if args.gradient_checkpointing:
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
-# --- CONDITIONAL COMPILATION ---
-# Only compile if model_type is 'long', otherwise run standard PyTorch
-if args.model_type == "long":
-    if accelerator.is_main_process:
-        console.print(f"[bold green][Performance] Model Type is '{args.model_type}'. Applying torch.compile()...[/bold green]")
-        
-    # Check if DeepSpeed/DDP has wrapped the model
-    if hasattr(model, "module"):
-        # IMPORTANT: Compile the INNER module to avoid RecursionError with DeepSpeed Engine
-        model.module = torch.compile(model.module, mode="default")
-    else:
-        # Fallback for single-GPU/non-DeepSpeed runs
-        model = torch.compile(model, mode="default")
-else:
-    if accelerator.is_main_process:
-        console.print(f"[dim][Performance] Model Type is '{args.model_type}'. Skipping torch.compile.[/dim]")
 
 
 # ===============================
@@ -207,6 +193,27 @@ scheduler = get_cosine_schedule_with_warmup(
 model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
     model, optimizer, train_loader, val_loader, scheduler
 )
+
+# --- CONDITIONAL COMPILATION ---
+# Only compile if model_type is 'long', otherwise run standard PyTorch
+if args.model_type == "long":
+    if accelerator.is_main_process:
+        console.print(f"[bold green][Performance] Model Type is '{args.model_type}'. Applying torch.compile()...[/bold green]")
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    compiled_model = torch.compile(unwrapped_model, mode="default")
+    
+    # Check if DeepSpeed/DDP has wrapped the model
+    if hasattr(model, "module"):
+        # IMPORTANT: Compile the INNER module to avoid RecursionError with DeepSpeed Engine
+        model.module = compiled_model
+    else:
+        # Fallback for single-GPU/non-DeepSpeed runs
+        model = compiled_model
+else:
+    if accelerator.is_main_process:
+        console.print(f"[dim][Performance] Model Type is '{args.model_type}'. Skipping torch.compile.[/dim]")
+        
 
 # CRITICAL: Ensure all processes have finished 'preparing' before moving to state loading
 accelerator.wait_for_everyone()
@@ -355,6 +362,8 @@ try:
             # --- EVALUATION ---
             if global_step % args.eval_steps == 0:
                 # 1. Calculate Val Loss
+                accelerator.wait_for_everyone()
+    
                 model.eval()
                 val_losses = []
                 # Limit eval to 30 batches for speed
@@ -370,22 +379,29 @@ try:
                 
                 avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("inf")
                 val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 9999.0
-                
                 val_loss_display = f"{avg_val_loss:.4f}"
                 accelerator.log({"val_loss": avg_val_loss, "val_ppl": val_ppl}, step=global_step)
-                model.train()
 
                 # 2. Generate Sample (Main Process Only)
+                prompt_used, sample_text = log_sample_generation(model, tokenizer, accelerator, global_step)
+
                 if accelerator.is_main_process:
-                    prompt_used, sample_text = log_sample_generation(model, tokenizer, accelerator, global_step)
                     # Update UI variables
                     gen_prompt_display = prompt_used
                     gen_text_display = f"[white]{sample_text[:300]}...[/white]"
 
+                # Sync 2: Crucial! GPU 1 waits for GPU 0's generation/logging to finish
+                accelerator.wait_for_everyone()
+                model.train()
+
             # --- SAVE ---
             if global_step % args.save_steps == 0:
+                # Sync 3: Ensure all gradients/evals are finished before touching disk
                 accelerator.wait_for_everyone()
                 accelerator.save_state(f"{args.checkpoint_dir}/step_{global_step}")
+
+                if accelerator.is_main_process:
+                    console.print(f"[bold cyan]Checkpoint saved at step {global_step}[/bold cyan]")
 
     # --- FINALIZE ---
     if accelerator.is_main_process:

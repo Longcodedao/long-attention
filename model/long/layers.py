@@ -254,7 +254,7 @@ class RoPESelfAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.rotary_emb = RotaryEmbedding(self.head_dim, base = config.rope_base_dim)
         
     def forward(self, x, state=None):
         B, T, C = x.shape
