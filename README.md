@@ -1,21 +1,21 @@
 # LongAttention: A Holographic Linear-Time Mechanism for Infinite Context
 
-**Status:** Pre-Alpha / Internal Validation
-**Target:** ICML Submission
-**Core Claim:** Infinite Context with Exact Associative Recall via Complex-Valued Holographic Memory.
 
 ---
 
-## 🚀 Architectures: 
+## 🚀 Overview: 
 
+An official PyTorch implementation of a novel "Holographic" architecture designed to solve the quadratic complexity bottleneck of Transformers. By compressing context into a fixed-size holographic superposition, this model achieves linear-time scaling without sacrificing the recall capabilities of standard attention
 
+This implementation features a Hybrid Architecture, combining efficient LongAttention with an "Anchor" 
+Rope Self-Attention to maintain effectiveness over the long-context window.
 
 ---
 
 ## 🛠️ Usage
 
 ### Quick Start
-1. Install libraries
+1. Installing libraries
 ```bash
 uv sync
 source .venv/bin/activate

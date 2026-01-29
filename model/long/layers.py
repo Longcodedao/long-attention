@@ -61,7 +61,7 @@ class LongAttention(nn.Module):
 
         # Gamma Initialization (SSM style decay)
         with torch.no_grad():
-            min_decay = 0.9
+            min_decay = 0.5
             max_decay = 0.9999
             # min_decay = 0.5   # Changed from 0.9
             # max_decay = 0.95
@@ -168,12 +168,13 @@ class LongAttention(nn.Module):
         q = F.normalize(self.q_proj(x).view(B, T, self.num_heads, self.head_dim), p=2, dim=-1)
         k = F.normalize(self.k_proj(x).view(B, T, self.num_heads, self.head_dim), p=2, dim=-1)
         v = self.v_norm(self.v_proj(x).view(B, T, self.num_heads, self.head_dim))
-
+        # v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
+        
         # --- 3. Gating ---
         i_gate = torch.sigmoid(self.input_gate_proj(x_conv)).view(B, T, self.num_heads, self.head_dim)
-        i_gate = i_gate * 0.95 + 0.025  # Clamp between [0.025, 0.975] for stability
+        # i_gate = i_gate * 0.95 + 0.025  # Clamp between [0.025, 0.975] for stability
         gamma = torch.sigmoid(self.gamma_proj(x_conv)).view(B, T, self.num_heads, 1)
-        gamma = gamma * 0.998 # Never allow gamma to be 1.0 or higher
+        # gamma = gamma * 0.998 # Never allow gamma to be 1.0 or higher
 
         
         # --- 4. Scan Logic (SSM Core) ---
