@@ -8,6 +8,7 @@ from .config import LongConfig
 # Ensure you have these ops available in your .ops file
 from .ops import recurrent_scan, chunked_parallel_scan
 
+
 class LongAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -48,10 +49,10 @@ class LongAttention(nn.Module):
         Custom initialization logic.
         """
         # 1. Projections
-        nn.init.xavier_uniform_(self.q_proj.weight)
-        nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.o_proj.weight)
+        nn.init.normal_(self.q_proj.weight, std = 0.02)
+        nn.init.normal_(self.k_proj.weight, std = 0.02)
+        nn.init.normal_(self.v_proj.weight, std = 0.02)
+        nn.init.normal_(self.o_proj.weight, std = 0.02)
 
         # 2. Input Gate: Start CLOSED (Bias -3.0 or similar)
         # Prevents initial instability/explosive loss
@@ -62,6 +63,8 @@ class LongAttention(nn.Module):
         with torch.no_grad():
             min_decay = 0.9
             max_decay = 0.9999
+            # min_decay = 0.5   # Changed from 0.9
+            # max_decay = 0.95
             target_decays = 1 - torch.exp(
                 torch.linspace(
                     math.log(1 - min_decay), 
@@ -77,6 +80,12 @@ class LongAttention(nn.Module):
         # 3. Output Gate: Start NEUTRAL (Bias 0.0)
         nn.init.constant_(self.output_gate_proj.bias, 0.0)
 
+        # # Add this to reset_parameters
+        # # This scales the contribution of each layer relative to the depth of the model, 
+        # # which is a standard trick in GPT-style architectures to keep the residual 
+        # # variance under control.
+        # nn.init.normal_(self.o_proj.weight, std=0.02 / math.sqrt(self.config.num_hidden_layers))
+        
     def forward(self, x, state=None):
         B, T, C = x.shape
         
@@ -162,7 +171,9 @@ class LongAttention(nn.Module):
 
         # --- 3. Gating ---
         i_gate = torch.sigmoid(self.input_gate_proj(x_conv)).view(B, T, self.num_heads, self.head_dim)
+        i_gate = i_gate * 0.95 + 0.025  # Clamp between [0.025, 0.975] for stability
         gamma = torch.sigmoid(self.gamma_proj(x_conv)).view(B, T, self.num_heads, 1)
+        gamma = gamma * 0.998 # Never allow gamma to be 1.0 or higher
 
         
         # --- 4. Scan Logic (SSM Core) ---
@@ -181,7 +192,8 @@ class LongAttention(nn.Module):
         mem_out = self.mem_norm(mem)
         
         # Attention: Q * Memory
-        out = (mem_out * q).reshape(B, T, C)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        out = (mem_out * q * scale).reshape(B, T, C)
         
         # GroupNorm on the combined output
         out = self.grp_norm(out.reshape(B*T, C)).view(B, T, C)
@@ -191,6 +203,7 @@ class LongAttention(nn.Module):
         
         return self.o_proj(out), (next_rnn_state, new_conv_cache)
 
+        
 
 
 class LongMLP(nn.Module):

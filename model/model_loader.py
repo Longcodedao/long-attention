@@ -108,17 +108,9 @@ def get_model_and_tokenizer(model_type,
         )
         model = Mamba2ForCausalLM(config)
         
-    # ==========================
-    # 4. Holo
-    # ==========================
-    elif model_type.lower() == "holo":
-        config = HoloConfig.from_preset(model_size, use_version=2)
-        config.vocab_size = vocab_size 
-        config.max_position_embeddings = seq_len
-        model = HoloForCausalLM(config)
 
     # ==========================
-    # 5. Long LLM
+    # 4. Long LLM
     # ==========================
     elif model_type.lower() == "long":
         print(f"[Model Loader] Initializing Long LLM ({model_size})...")
@@ -200,9 +192,6 @@ def load_model_from_path(model_path, model_type=None, device="cpu"):
 
     if model_type == "long":
         model = LongForCausalLM.from_pretrained(model_path)
-
-    elif model_type == "holo":
-        model = HoloForCausalLM.from_pretrained(model_path)
 
     elif model_type == "mamba":
         model = MambaForCausalLM.from_pretrained(model_path)

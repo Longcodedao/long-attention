@@ -88,7 +88,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LLM Training Script - PG19")
     parser.add_argument("--dataset", type=str, default="pg19", help="dataset name")
     parser.add_argument("--val_dataset", type=str, default="pg19", help="validation dataset name")
-    parser.add_argument("--model_type", type=str, default="long", choices=["holo", "gpt2", "mamba", "mamba2", "long"], help="Model architecture")
+    parser.add_argument("--model_type", type=str, default="long", choices=["gpt2", "mamba", "mamba2", "long"], help="Model architecture")
     parser.add_argument("--model_size", type=str, default="small", help="Model size")
     
     # PG19 specific hyperparams
