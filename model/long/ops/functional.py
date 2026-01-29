@@ -103,16 +103,20 @@ def chunked_parallel_scan(k, v, gate, gamma, chunk_size=128):
     # Cumsum of log(gamma)
     log_gamma = torch.log(gamma_chunk + 1e-10)
     S = torch.cumsum(log_gamma, dim=2) # [B, N, C, H, 1]
+    S = torch.clamp(S, min=-50.0, max=50.0)
     
-    # Local Scan Formula: 
+    # Local Scan Formula: h_t = exp(S_t) * cumsum( u_t * exp(-S_t) )
+    exp_S = torch.exp(S)
+    exp_neg_S = torch.exp(-S)
+    
     # h_t = exp(S_t) * cumsum( u_t * exp(-S_t) )
-    u_prime = u_chunk * torch.exp(-S)
+    u_prime = u_chunk * exp_neg_S
     scan_prime = torch.cumsum(u_prime, dim=2)
-    h_intra = scan_prime * torch.exp(S)
+    h_intra = scan_prime * exp_S
 
     # 4. Inter-Chunk Recurrence (The Carry)
     # Total decay for a block is exp(S_last)
-    chunk_decay = torch.exp(S[:, :, -1]) # [B, N, H, 1]
+    chunk_decay = exp_S[:, :, -1]  # [B, N, H, 1]
     chunk_end_states = h_intra[:, :, -1] # [B, N, H, D]
     
     carry_states = []
@@ -123,8 +127,10 @@ def chunked_parallel_scan(k, v, gate, gamma, chunk_size=128):
         # Update carry: Carry_next = Carry_curr * Block_Decay + Block_End_State
         current_decay = chunk_decay[:, i] # [B, H, 1]
         current_end = chunk_end_states[:, i]
+        
         last_carry = (last_carry * current_decay) + current_end
 
+        last_carry = torch.clamp(last_carry, min=-1e5, max=1e5)
     # Stack carries [B, N, 1, H, D] for broadcasting
     carry_states = torch.stack(carry_states, dim=1).unsqueeze(2)
 
@@ -136,6 +142,8 @@ def chunked_parallel_scan(k, v, gate, gamma, chunk_size=128):
 
     # 6. Cleanup
     h_final = h_final.view(B, T_padded, H, D)
+    h_final = torch.clamp(h_final, min=-1e4, max=1e4)
+    
     if pad_len > 0:
         h_final = h_final[:, :T]
     

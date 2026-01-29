@@ -304,10 +304,14 @@ try:
                     grad_norm_display = f"{total_norm.item():.2f}"
                 else:
                     grad_norm_display = f"{total_norm:.2f}"
-            
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+
+                if torch.isnan(total_norm) or torch.isinf(total_norm):
+                    console.print(f"!!! Skipping Step {global_step} due to NaN/Inf Grad Norm !!!")
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
             
             gathered_loss = accelerator.gather(loss.detach())
             loss_metric.update(gathered_loss.mean())
