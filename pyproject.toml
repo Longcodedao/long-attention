@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12, <3.14"
 dependencies = [
     "torch==2.7.0",
+    "transformers==4.57.0",
     "torchvision==0.22.0",
     "torchaudio==2.7.0",
     "ninja>=1.11.1",
@@ -56,6 +57,16 @@ causal-conv1d = [
     { git = "https://github.com/Dao-AILab/causal-conv1d/", tag = "v1.5.4", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" }
 ]
 
+# mamba-ssm = [
+#     # PATH A: Binary Wheels (Linux x86_64 ONLY) - ABI=True
+#     { url = "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'" },
+#     { url = "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'" },
+#     { url = "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0+cu12torch2.7cxx11abiTRUE-cp313-cp313-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.13'" },
+
+#     # PATH B: Fallback to Source (Mac, Windows, or ARM Linux)
+#     { git = "https://github.com/state-spaces/mamba", tag = "v2.3.0", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" }
+# ]
+
 mamba-ssm = [
     # PATH A: Binary Wheels (Linux x86_64 ONLY) - ABI=True
     { url = "https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'" },
@@ -65,4 +76,3 @@ mamba-ssm = [
     # PATH B: Fallback to Source (Mac, Windows, or ARM Linux)
     { git = "https://github.com/state-spaces/mamba", tag = "v2.2.6.post3", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" }
 ]
-
