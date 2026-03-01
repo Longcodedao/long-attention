@@ -24,6 +24,8 @@ def load_data_source(name, split):
         return load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split, streaming=True)
     elif name == "pg19":
         return load_dataset("emozilla/pg19", split=split, streaming=True)
+    elif name == "tinystories":
+        return load_dataset("roneneldan/TinyStories", split=split, streaming=True)
         
     elif name == "fineweb-edu":
         # ... (Same as before) ...

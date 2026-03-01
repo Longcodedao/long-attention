@@ -11,8 +11,8 @@ from transformers import (
 )
 
 # Adjust these imports if your folder structure is slightly different
-from model.holo.configuration_holo import HoloConfig
-from model.holo.modeling_holo import HoloForCausalLM 
+# from model.holo.configuration_holo import HoloConfig
+# from model.holo.modeling_holo import HoloForCausalLM 
 from model.long import LongConfig, LongForCausalLM 
 from model.gpt2.gpt2_configs import get_gpt2_config_dict
 from model.mamba.mamba_configs import get_mamba_config_dict
@@ -129,6 +129,7 @@ def get_model_and_tokenizer(model_type,
             config.hidden_size = 768
             config.num_hidden_layers = 18 
             config.num_heads = 12
+            config.hybrid_ratio = 0
         elif model_size == "medium":
             config.hidden_size = 1024
             config.num_hidden_layers = 24

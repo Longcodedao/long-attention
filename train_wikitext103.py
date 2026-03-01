@@ -5,6 +5,7 @@ import torch
 import random
 import argparse
 import datasets
+import datetime
 import transformers
 import warnings
 import torch.nn.functional as F
@@ -28,17 +29,18 @@ datasets.utils.logging.set_verbosity_error()
 transformers.utils.logging.set_verbosity_error()
 warnings.filterwarnings("ignore", message=".*barrier().*")
 
+
 # ===============================
 # 0. Monitoring Strategy: Evaluation Prompts
 # ===============================
 EVAL_PROMPTS = [
-    "The history of Vietnam is",
-    "To bake a chocolate cake, you must",
-    "The planet Mars is known for",
-    "Python is a programming language that",
-    "The quick brown fox jumps over",
-    "In the early 20th century, the economy",
-    "What is New York City? It "
+    "Once upon a time, there was a little girl named Lily.",
+    "Timmy went to the park to play with his",
+    "The big brown dog barked at the",
+    "One day, a magical bird flew into the",
+    "Sarah was very happy because she found a",
+    "In a small house at the end of the street,",
+    "The tiny mouse looked up at the tall"
 ]
 
 def log_sample_generation(model, tokenizer, accelerator, global_step):
@@ -47,6 +49,10 @@ def log_sample_generation(model, tokenizer, accelerator, global_step):
     """
     model.eval()
     
+    eval_model = accelerator.unwrap_model(model)
+    if hasattr(eval_model, "_orig_mod"):
+        eval_model = eval_model._orig_mod
+        
     prompt = random.choice(EVAL_PROMPTS)
     
     device = next(model.parameters()).device
@@ -54,28 +60,31 @@ def log_sample_generation(model, tokenizer, accelerator, global_step):
 
     generated_text = ""
     try:
-        with torch.no_grad():
-            output_ids = model.generate(
+        with torch.inference_mode():
+            output_ids = eval_model.generate(
                 input_ids, 
                 max_new_tokens=50,       
                 do_sample=True,          
-                temperature=0.7,         
+                temperature=0.8,         
                 top_k=40,                
-                repetition_penalty=1.2,  
+                repetition_penalty=1.05,  
                 pad_token_id=tokenizer.eos_token_id
             )
         generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        del input_ids, output_ids
+        torch.cuda.empty_cache()
         
     except Exception as e:
         generated_text = f"[Generation Error]: {e}"
-
+        
+    
     model.train()
 
     if accelerator.is_main_process:
         tracker = accelerator.get_tracker("tensorboard")
         if tracker:
             tracker.writer.add_text("Validation/Sample", f"**Prompt:** {prompt}\n\n**Output:** {generated_text}", global_step)
-            
+    
     return prompt, generated_text
 
 # ===============================
@@ -83,8 +92,9 @@ def log_sample_generation(model, tokenizer, accelerator, global_step):
 # ===============================
 def parse_args():
     parser = argparse.ArgumentParser(description="Mamba/Transformer Training Script")
-    parser.add_argument("--dataset", type=str, default="wikitext", help="dataset name")
-    parser.add_argument("--val_dataset", type=str, default="wikitext", help="validation dataset name")
+    parser.add_argument("--dataset", type=str, default="tinystories", help="Hugging Face dataset name")
+    parser.add_argument("--val_dataset", type=str, default="tinystories", help="validation dataset name")
+
     parser.add_argument("--model_type", type=str, default="mamba2", choices=["gpt2", "mamba", "mamba2", "long"], help="Model architecture")
     parser.add_argument("--model_size", type=str, default="small", help="Model size (small, medium, etc.)")
     
@@ -108,7 +118,6 @@ def parse_args():
     return parser.parse_args()
 
 args = parse_args()
-
 
 # ===============================
 # 2. Setup Accelerator
@@ -298,7 +307,7 @@ try:
             
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
             gathered_loss = accelerator.gather(loss.detach())
             loss_metric.update(gathered_loss.mean())
@@ -352,21 +361,46 @@ try:
             
             # --- EVALUATION ---
             if global_step % args.eval_steps == 0:
-                # 1. Calculate Val Loss
+                # 1. Dọn rác từ bước train trước khi eval
+                del outputs, loss, batch
+                torch.cuda.empty_cache() # Ép GPU giải phóng vùng nhớ thừa
+
+                # 2. Calculate Val Loss
                 model.eval()
                 val_losses = []
                 # Limit eval to 20 batches for speed
                 for _, vbatch in zip(range(20), val_loader):
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         v_out = model(input_ids=vbatch["input_ids"].to(accelerator.device), labels=vbatch["input_ids"].to(accelerator.device))
                         val_losses.append(accelerator.gather(v_out.loss).mean().item())
-                
+                        
+                        # Dọn rác của từng batch eval ngay lập tức
+                        del v_out, vbatch
+
                 avg_val_loss = sum(val_losses) / len(val_losses)
                 val_ppl = math.exp(avg_val_loss) if avg_val_loss < 20 else 9999.0
                 
                 val_loss_display = f"{avg_val_loss:.4f}"
                 accelerator.log({"val_loss": avg_val_loss, "val_ppl": val_ppl}, step=global_step)
-                model.train()
+                
+                # 3. Generate Sample (Main Process Only)
+                if accelerator.is_main_process:
+                    # Tạm thời bật use_cache cho generation
+                    original_cache = getattr(model.config, "use_cache", False)
+                    if hasattr(model.config, "use_cache"):
+                        model.config.use_cache = True
+                        
+                    prompt_used, sample_text = log_sample_generation(model, tokenizer, accelerator, global_step)
+                    
+                    # Trả lại trạng thái cũ cho training
+                    if hasattr(model.config, "use_cache"):
+                        model.config.use_cache = original_cache
+                        
+                    # Update UI variables
+                    gen_prompt_display = prompt_used
+                    gen_text_display = f"[white]{sample_text}[/white]"
+
+                model.train() # Đưa model.train() xuống cuối cùng sau khi generate xong
 
                 # 2. Generate Sample (Main Process Only)
                 if accelerator.is_main_process:
